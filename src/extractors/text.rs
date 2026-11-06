@@ -9473,9 +9473,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),

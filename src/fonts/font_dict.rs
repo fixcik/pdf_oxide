@@ -33,6 +33,28 @@ pub struct Std14Flags {
 }
 
 /// Font information extracted from a PDF font dictionary.
+/// Shared per-font `char_to_unicode` memo. The unique `id` keys a per-thread
+/// cache so hot decode loops never touch a shared lock or cache line.
+#[derive(Debug)]
+pub struct UnicodeMemo {
+    id: u64,
+    map: std::sync::RwLock<std::collections::HashMap<u32, Option<String>>>,
+}
+impl Default for UnicodeMemo {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            map: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+thread_local! {
+    static TL_UNICODE_MEMO: std::cell::RefCell<std::collections::HashMap<(u64, u32), Option<Box<str>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const TL_UNICODE_MEMO_MAX: usize = 200_000;
+
 #[derive(Debug, Clone)]
 pub struct FontInfo {
     /// Base font name (e.g., "Times-Roman", "Helvetica-Bold")
@@ -145,8 +167,7 @@ pub struct FontInfo {
     /// Per-font memo of `char_to_unicode`. Type0/CID fonts have no
     /// `byte_to_char_table`, so without this each glyph re-runs the decode
     /// cascade. `Arc<Mutex<…>>` keeps `FontInfo: Clone` (clones share the memo).
-    pub type0_unicode_memo:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<String>>>>,
+    pub type0_unicode_memo: std::sync::Arc<UnicodeMemo>,
     /// Pre-computed byte→width lookup for simple (non-Type0) fonts.
     /// Index by byte value (0-255). Built lazily on first advance_position call.
     /// Eliminates per-byte bounds check and subtraction in get_glyph_width.
@@ -1511,9 +1532,7 @@ impl FontInfo {
             cff_cid_to_gid,
             multi_char_map: diff_multi_char_map,
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -4205,20 +4224,56 @@ impl FontInfo {
     /// inspects surrounding context (neighboring chars, word boundaries) to
     /// decide whether to split — keeping font_dict a pure encoding layer.
     pub fn char_to_unicode(&self, char_code: u32) -> Option<String> {
-        // Serve from the per-font memo. Read and write are separate lock scopes
-        // so the decode in between never holds the lock.
-        if let Ok(memo) = self.type0_unicode_memo.lock() {
-            if let Some(cached) = memo.get(&char_code) {
-                return cached.clone();
+        self.char_to_unicode_with(char_code, |s| s.map(str::to_owned))
+    }
+
+    /// Lock-free hot path: resolve `char_code` through a per-thread memo
+    /// (keyed by this font's memo id) and hand the result to `f` without
+    /// allocating. Falls back to the shared per-font memo, then to the decode
+    /// cascade, populating both.
+    pub(crate) fn char_to_unicode_with<R>(
+        &self,
+        char_code: u32,
+        f: impl FnOnce(Option<&str>) -> R,
+    ) -> R {
+        let key = (self.type0_unicode_memo.id, char_code);
+        let mut f = Some(f);
+        let hit = TL_UNICODE_MEMO.with(|m| {
+            let m = m.try_borrow().ok()?;
+            let v = m.get(&key)?;
+            Some((f.take().unwrap())(v.as_deref()))
+        });
+        if let Some(r) = hit {
+            return r;
+        }
+        let f = f.take().unwrap();
+        let shared = self
+            .type0_unicode_memo
+            .map
+            .read()
+            .ok()
+            .and_then(|memo| memo.get(&char_code).cloned());
+        let result = match shared {
+            Some(r) => r,
+            None => {
+                let r = self
+                    .char_to_unicode_uncached(char_code)
+                    .map(|s| normalize_cjk_radical_forms(&s));
+                if let Ok(mut memo) = self.type0_unicode_memo.map.write() {
+                    memo.insert(char_code, r.clone());
+                }
+                r
+            },
+        };
+        TL_UNICODE_MEMO.with(|m| {
+            if let Ok(mut m) = m.try_borrow_mut() {
+                if m.len() >= TL_UNICODE_MEMO_MAX {
+                    m.clear();
+                }
+                m.insert(key, result.as_deref().map(Box::from));
             }
-        }
-        let result = self
-            .char_to_unicode_uncached(char_code)
-            .map(|s| normalize_cjk_radical_forms(&s));
-        if let Ok(mut memo) = self.type0_unicode_memo.lock() {
-            memo.insert(char_code, result.clone());
-        }
-        result
+        });
+        f(result.as_deref())
     }
 
     /// Uncached decode cascade behind [`Self::char_to_unicode`].
@@ -6644,9 +6699,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6688,9 +6741,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6735,9 +6786,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6779,9 +6828,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6829,9 +6876,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6880,9 +6925,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6930,9 +6973,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -6978,9 +7019,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7124,9 +7163,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7260,9 +7297,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7314,9 +7349,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7361,9 +7394,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7412,9 +7443,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7459,9 +7488,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7506,9 +7533,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7557,9 +7582,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7604,9 +7627,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7651,9 +7672,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7702,9 +7721,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7748,9 +7765,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7794,9 +7809,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7840,9 +7853,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7886,9 +7897,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7932,9 +7941,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -7978,9 +7985,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8024,9 +8029,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8070,9 +8073,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8364,9 +8365,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8422,9 +8421,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8476,9 +8473,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8540,9 +8535,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -8601,9 +8594,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -10782,9 +10773,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -10837,9 +10826,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -10888,9 +10875,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -10937,9 +10922,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -10992,9 +10975,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
@@ -11144,9 +11125,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),

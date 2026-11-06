@@ -320,7 +320,7 @@ pub struct LazyCMap {
     /// Parsed CMap, lazily loaded on first access.
     /// Uses Arc for efficient sharing between threads.
     /// Uses Mutex for thread-safe mutable access.
-    parsed: Arc<Mutex<Option<Arc<CMap>>>>,
+    parsed: Arc<std::sync::OnceLock<Option<Arc<CMap>>>>,
 }
 
 impl LazyCMap {
@@ -340,7 +340,7 @@ impl LazyCMap {
         LazyCMap {
             raw_stream,
             cache_key,
-            parsed: Arc::new(Mutex::new(None)),
+            parsed: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -383,48 +383,40 @@ impl LazyCMap {
 
     /// Returns the parsed CMap, loading and caching it on first access.
     pub fn get(&self) -> Option<Arc<CMap>> {
-        // Step 1: Check local cache
-        let mut parsed_guard = self.parsed.lock_or_recover();
-
-        if let Some(cached) = parsed_guard.as_ref() {
-            // Already parsed locally, return immediately
-            return Some(Arc::clone(cached));
+        // Step 1: Check local cache (lock-free fast path once initialised)
+        if let Some(cached) = self.parsed.get() {
+            return cached.clone();
         }
-
-        // Step 2: Check global cache
-        {
-            let mut global = CMAP_CACHE.lock_or_recover();
-            if let Some(cached) = global.get(&self.cache_key) {
-                let arc = Arc::clone(cached);
-                // Update local cache for next access
-                *parsed_guard = Some(Arc::clone(&arc));
-                log::debug!("CMap cache hit (global) for stream hash {:?}", self.cache_key);
-                return Some(arc);
+        let computed = {
+            // Step 2: Check global cache
+            let hit = {
+                let mut global = CMAP_CACHE.lock_or_recover();
+                global.get(&self.cache_key).cloned()
+            };
+            match hit {
+                Some(arc) => {
+                    log::debug!("CMap cache hit (global) for stream hash {:?}", self.cache_key);
+                    Some(arc)
+                },
+                // Step 3: Parse on miss
+                None => match parse_tounicode_cmap(&self.raw_stream) {
+                    Ok(cmap) => {
+                        let cmap_arc = Arc::new(cmap);
+                        {
+                            let mut global = CMAP_CACHE.lock_or_recover();
+                            global.insert(self.cache_key, Arc::clone(&cmap_arc));
+                        }
+                        log::debug!("CMap parsed and cached (stream hash {:?})", self.cache_key);
+                        Some(cmap_arc)
+                    },
+                    Err(e) => {
+                        log::warn!("Failed to parse lazy CMap: {}", e);
+                        None
+                    },
+                },
             }
-        }
-
-        // Step 3: Parse on miss
-        match parse_tounicode_cmap(&self.raw_stream) {
-            Ok(cmap) => {
-                let cmap_arc = Arc::new(cmap);
-
-                // Update local cache
-                *parsed_guard = Some(Arc::clone(&cmap_arc));
-
-                // Update global cache
-                {
-                    let mut global = CMAP_CACHE.lock_or_recover();
-                    global.insert(self.cache_key, Arc::clone(&cmap_arc));
-                }
-
-                log::debug!("CMap parsed and cached (stream hash {:?})", self.cache_key);
-                Some(cmap_arc)
-            },
-            Err(e) => {
-                log::warn!("Failed to parse lazy CMap: {}", e);
-                None
-            },
-        }
+        };
+        self.parsed.get_or_init(|| computed).clone()
     }
 }
 

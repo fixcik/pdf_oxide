@@ -390,6 +390,30 @@ pub(crate) fn char_codes_with_widths(bytes: &[u8], font: &FontInfo) -> Vec<(u32,
     }
 }
 
+/// Allocation-free variant of `resolve_char` + the `\u{FFFD}` filter used by
+/// the decode loops: appends straight into `out`.
+fn push_resolved(font: &FontInfo, code: u32, policy: DecodePolicy, out: &mut String) {
+    let handled = font.char_to_unicode_with(code, |hit| match hit {
+        Some(s) => {
+            if s != "\u{FFFD}" || policy.preserve_unmapped {
+                out.push_str(s);
+            }
+            true
+        },
+        None => false,
+    });
+    if !handled {
+        let s = if char::from_u32(code).is_none() && !policy.question_mark_for_invalid {
+            "\u{FFFD}".to_string()
+        } else {
+            fallback_char_to_unicode(code)
+        };
+        if s != "\u{FFFD}" || policy.preserve_unmapped {
+            out.push_str(&s);
+        }
+    }
+}
+
 fn resolve_char(font: &FontInfo, code: u32, policy: DecodePolicy) -> String {
     if let Some(char_str) = font.char_to_unicode(code) {
         return char_str;
@@ -416,10 +440,7 @@ pub(crate) fn decode_text_to_unicode(
                     result.push(c);
                 } else {
                     // Fallback: multi-char mapping or unmapped byte
-                    let char_str = resolve_char(font, byte as u32, policy);
-                    if char_str != "\u{FFFD}" || policy.preserve_unmapped {
-                        result.push_str(&char_str);
-                    }
+                    push_resolved(font, byte as u32, policy, &mut result);
                 }
             }
         } else if font_has_utf8_cmap(font) {
@@ -432,19 +453,12 @@ pub(crate) fn decode_text_to_unicode(
             // the same multi-byte codes. Isolated to UTF-8-CMap fonts: every
             // other font keeps the path below unchanged.
             for code in utf8_codes(bytes) {
-                let char_str = resolve_char(font, code, policy);
-                if char_str != "\u{FFFD}" || policy.preserve_unmapped {
-                    result.push_str(&char_str);
-                }
+                push_resolved(font, code, policy, &mut result);
             }
         } else {
             // Complex font: use unified iterator for robust multi-byte decoding
             for (char_code, _) in TextCharIter::new(bytes, Some(font)) {
-                let char_str = resolve_char(font, char_code as u32, policy);
-
-                if char_str != "\u{FFFD}" || policy.preserve_unmapped {
-                    result.push_str(&char_str);
-                }
+                push_resolved(font, char_code as u32, policy, &mut result);
             }
         }
         result
@@ -513,7 +527,7 @@ mod tests {
             cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            type0_unicode_memo: Default::default(),
             byte_to_width_table: std::sync::OnceLock::new(),
             weight_memo: std::sync::OnceLock::new(),
             italic_memo: std::sync::OnceLock::new(),
