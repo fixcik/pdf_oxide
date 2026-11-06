@@ -547,6 +547,9 @@ pub struct PdfDocument {
     /// shared document wait for one computation instead of repeating it.
     signatures_compute_lock: Mutex<()>,
     struct_tree_compute_lock: Mutex<()>,
+    /// Whether `postprocess_spans` refines `TextSpan::char_x_offsets` from a
+    /// second, per-character pass over the page content (default: on).
+    refine_char_x_offsets: std::sync::atomic::AtomicBool,
     /// Per-page lightweight search index (page text + span bounding boxes,
     /// no fonts/glyph widths) built lazily by `search()`/`search_page()` and
     /// reused across repeated calls on the same document. Unlike
@@ -1320,6 +1323,7 @@ impl PdfDocument {
             page_raw_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
             signatures_compute_lock: Mutex::new(()),
             struct_tree_compute_lock: Mutex::new(()),
+            refine_char_x_offsets: std::sync::atomic::AtomicBool::new(true),
             search_index: Mutex::new(HashMap::new()),
             page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
@@ -7447,6 +7451,23 @@ impl PdfDocument {
     /// Mark a specific rectangular region on a page for erasure.
     ///
     /// Content in this region will be excluded from all subsequent text extractions.
+    /// Enable or disable the per-character refinement of
+    /// [`TextSpan::char_x_offsets`](crate::layout::TextSpan::char_x_offsets).
+    ///
+    /// The refinement re-runs the content stream a second time per page in
+    /// character mode (`extract_chars`) to snap each span's glyph offsets to
+    /// the exact glyph origins. Text, reading order, structured regions,
+    /// tables and Markdown do not depend on it; only consumers of
+    /// `char_x_offsets` / `to_chars()` on the spans returned by
+    /// [`extract_spans`](Self::extract_spans) do. Disabling it saves roughly
+    /// 10% of total per-page extraction time. Default: enabled. Clears the
+    /// span caches so the setting takes effect for subsequent calls.
+    pub fn set_char_x_offset_refinement(&self, enabled: bool) {
+        self.refine_char_x_offsets.store(enabled, Ordering::Relaxed);
+        self.page_spans_cache.lock_or_recover().clear();
+        self.search_index.lock_or_recover().clear();
+    }
+
     pub fn erase_region(&self, page_index: usize, rect: crate::geometry::Rect) -> Result<()> {
         self.erase_regions
             .lock_or_recover()
@@ -13304,7 +13325,9 @@ impl PdfDocument {
         // spec-aligned positions instead of drifting prefix-sums. Runs last, on
         // the fully post-processed spans, so alignment sees the same text the
         // consumers do.
-        self.stamp_char_x_offsets(page_index, &mut spans);
+        if self.refine_char_x_offsets.load(Ordering::Relaxed) {
+            self.stamp_char_x_offsets(page_index, &mut spans);
+        }
 
         Ok(spans)
     }
