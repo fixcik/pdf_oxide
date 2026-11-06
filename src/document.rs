@@ -535,6 +535,10 @@ pub struct PdfDocument {
     /// the second from cache. Cleared by redaction (`erase_region` /
     /// `clear_erase_regions`), the only span-affecting mutation.
     page_spans_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
+    /// Raw (pre-`postprocess_spans`) default-config spans per page. The
+    /// structured, reading-order and table paths each re-parse the content
+    /// stream otherwise; this serves the repeat parses from one extraction.
+    page_raw_spans_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
     /// Per-page lightweight search index (page text + span bounding boxes,
     /// no fonts/glyph widths) built lazily by `search()`/`search_page()` and
     /// reused across repeated calls on the same document. Unlike
@@ -1305,6 +1309,7 @@ impl PdfDocument {
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
             page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
+            page_raw_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
             search_index: Mutex::new(HashMap::new()),
             page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
@@ -7420,6 +7425,7 @@ impl PdfDocument {
             .push(rect);
         // Redaction changes a page's spans; drop the span cache.
         self.page_spans_cache.lock_or_recover().clear();
+        self.page_raw_spans_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         Ok(())
     }
@@ -7428,6 +7434,7 @@ impl PdfDocument {
     pub fn clear_erase_regions(&self, page_index: usize) -> Result<()> {
         self.erase_regions.lock_or_recover().remove(&page_index);
         self.page_spans_cache.lock_or_recover().clear();
+        self.page_raw_spans_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         Ok(())
     }
@@ -17136,6 +17143,17 @@ impl PdfDocument {
     /// `extract_spans_with_reading_order`. Spans are returned without any
     /// sorting or erase-region filtering applied.
     fn extract_spans_raw(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
+        if let Some(cached) = self.page_raw_spans_cache.lock_or_recover().get(&page_index) {
+            return Ok((**cached).clone());
+        }
+        let spans = self.extract_spans_raw_uncached(page_index)?;
+        self.page_raw_spans_cache
+            .lock_or_recover()
+            .insert(page_index, std::sync::Arc::new(spans.clone()));
+        Ok(spans)
+    }
+
+    fn extract_spans_raw_uncached(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
         self.extract_spans_raw_with_extraction_config(
             page_index,
             crate::extractors::TextExtractionConfig::default(),
