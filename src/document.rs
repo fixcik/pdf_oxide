@@ -492,7 +492,7 @@ pub struct PdfDocument {
     /// Page object cache keyed by page index to avoid re-traversing the page tree.
     /// The page tree structure is static (§7.7.3.2), so pages can be safely cached.
     /// Mutex provides interior mutability for `&self` read-path methods (#398).
-    page_cache: Mutex<HashMap<usize, Object>>,
+    page_cache: Mutex<HashMap<usize, Arc<Object>>>,
     /// Whether the bulk page tree walk has been attempted (successful or not).
     /// Prevents re-walking the tree on every cache miss for malformed PDFs.
     page_cache_populated: AtomicBool,
@@ -4578,7 +4578,7 @@ impl PdfDocument {
     ///
     /// MediaBox defines the physical boundaries of the page in user space units.
     pub fn get_page_media_box(&self, page_index: usize) -> Result<(f32, f32, f32, f32)> {
-        let page = self.get_page(page_index)?;
+        let page = self.get_page_arc(page_index)?;
         let page_dict = page
             .as_dict()
             .ok_or_else(|| Error::InvalidPdf("Page is not a dictionary".to_string()))?;
@@ -4692,7 +4692,7 @@ impl PdfDocument {
     /// up the page tree — a `/Rotate` set on an ancestor `/Pages` node
     /// is honoured, not just one on the leaf page object.
     pub fn get_page_rotation(&self, page_index: usize) -> Result<i32> {
-        let page = self.get_page(page_index)?;
+        let page = self.get_page_arc(page_index)?;
         let dict = page
             .as_dict()
             .ok_or_else(|| Error::InvalidPdf("Page is not a dictionary".to_string()))?;
@@ -4926,7 +4926,13 @@ impl PdfDocument {
     /// Returns an error if the page index is out of bounds or if the page
     /// tree structure is invalid.
     pub fn get_page(&self, page_index: usize) -> Result<Object> {
-        // Check page cache first — page tree is static per §7.7.3.2
+        Ok((*self.get_page_arc(page_index)?).clone())
+    }
+
+    /// Shared handle to the cached page dictionary. Internal hot paths
+    /// (media box, rotation, content, span extraction) only read the dict, so
+    /// they take this instead of deep-cloning the `Object` from `get_page`.
+    pub(crate) fn get_page_arc(&self, page_index: usize) -> Result<Arc<Object>> {
         if let Some(cached) = self.page_cache.lock_or_recover().get(&page_index).cloned() {
             return Ok(cached);
         }
@@ -4993,9 +4999,10 @@ impl PdfDocument {
             },
         }?;
 
+        let page = Arc::new(page);
         self.page_cache
             .lock_or_recover()
-            .insert(page_index, page.clone());
+            .insert(page_index, Arc::clone(&page));
         Ok(page)
     }
 
@@ -5028,7 +5035,7 @@ impl PdfDocument {
     fn prefetch_xobject_subtypes(&self) {
         // Collect all unique XObject refs from all cached pages
         let mut xobj_refs: Vec<ObjectRef> = Vec::new();
-        let page_dicts: Vec<Object> = self
+        let page_dicts: Vec<Arc<Object>> = self
             .page_cache
             .lock_or_recover()
             .values()
@@ -5149,7 +5156,7 @@ impl PdfDocument {
                 }
                 self.page_cache
                     .lock_or_recover()
-                    .insert(*page_index, Object::Dictionary(page_dict));
+                    .insert(*page_index, Arc::new(Object::Dictionary(page_dict)));
                 *page_index += 1;
             },
             "Pages" => {
@@ -12028,6 +12035,14 @@ impl PdfDocument {
         use crate::annotation_types::AnnotationSubtype;
         use crate::annotations::LinkAction;
 
+        // Cheap pre-check on the cached page dict: most pages carry no
+        // /Annots at all, and `get_annotations` would re-load and deep-clone
+        // the page object (under the object-cache lock) just to find that out.
+        if let Ok(page) = self.get_page_arc(page_index) {
+            if page.as_dict().is_some_and(|d| !d.contains_key("Annots")) {
+                return;
+            }
+        }
         let annots = match self.get_annotations(page_index) {
             Ok(a) => a,
             Err(_) => return,
@@ -17261,7 +17276,7 @@ impl PdfDocument {
         }
         use crate::extractors::TextExtractor;
 
-        let page = self.get_page(page_index)?;
+        let page = self.get_page_arc(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
@@ -17835,7 +17850,7 @@ impl PdfDocument {
         use crate::extractors::TextExtractor;
 
         // Get page object
-        let page = self.get_page(page_index)?;
+        let page = self.get_page_arc(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
@@ -18315,7 +18330,7 @@ impl PdfDocument {
     ) -> Result<Vec<crate::layout::TextChar>> {
         use crate::extractors::TextExtractor;
 
-        let page = self.get_page(page_index)?;
+        let page = self.get_page_arc(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
@@ -19244,7 +19259,7 @@ impl PdfDocument {
         self.ensure_encryption_initialized()?;
 
         // Get page object
-        let page = self.get_page(page_index)?;
+        let page = self.get_page_arc(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
