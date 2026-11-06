@@ -34,7 +34,7 @@ use rayon::prelude::*;
 
 use crate::converters::ConversionOptions;
 use crate::document::PdfDocument;
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// Parallel extractor that processes PDF pages across multiple threads.
 ///
@@ -71,103 +71,46 @@ impl ParallelExtractor {
     /// assert_eq!(pages.len(), 42);
     /// ```
     pub fn extract_all_text(path: &Path) -> Result<Vec<String>> {
-        let page_count = Self::get_page_count(path)?;
-        if page_count == 0 {
-            return Ok(Vec::new());
-        }
-        let path_buf = path.to_path_buf();
-
-        // Divide pages into batches for parallel processing.
-        // Each batch is processed by a single PdfDocument instance, amortizing
-        // the cost of document open, xref parse, page tree walk, and font loading.
-        let num_threads = rayon::current_num_threads().max(1);
-        let batch_size = page_count.div_ceil(num_threads);
-        let batches: Vec<(usize, usize)> = (0..page_count)
-            .step_by(batch_size)
-            .map(|start| (start, (start + batch_size).min(page_count)))
-            .collect();
-
-        let batch_results: std::result::Result<Vec<Vec<(usize, String)>>, Error> = batches
-            .into_par_iter()
-            .map(|(start, end)| {
-                let doc = PdfDocument::open(&path_buf)?;
-                let mut results = Vec::with_capacity(end - start);
-                for page_index in start..end {
-                    let text = doc.extract_text(page_index)?;
-                    results.push((page_index, text));
-                }
-                Ok(results)
-            })
-            .collect();
-
-        // Flatten and sort by page index to guarantee order
-        let mut all_results: Vec<(usize, String)> = batch_results?.into_iter().flatten().collect();
-        all_results.sort_unstable_by_key(|(idx, _)| *idx);
-        Ok(all_results.into_iter().map(|(_, text)| text).collect())
+        Self::run_shared(path, |doc, page_index| doc.extract_text(page_index))
     }
 
-    /// Extract Markdown from every page of a PDF in parallel.
-    ///
-    /// Behaves like [`extract_all_text`](Self::extract_all_text) but converts
-    /// each page to Markdown using the supplied [`ConversionOptions`].
-    ///
-    /// Returns a `Vec<String>` with one entry per page, in page order.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error encountered by any worker.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use std::path::Path;
-    /// use pdf_oxide::parallel::ParallelExtractor;
-    /// use pdf_oxide::converters::ConversionOptions;
-    ///
-    /// let opts = ConversionOptions::default();
-    /// let pages = ParallelExtractor::extract_all_markdown(
-    ///     Path::new("report.pdf"),
-    ///     &opts,
-    /// )?;
-    /// ```
     pub fn extract_all_markdown(path: &Path, options: &ConversionOptions) -> Result<Vec<String>> {
-        let page_count = Self::get_page_count(path)?;
+        Self::run_shared(path, |doc, page_index| doc.to_markdown(page_index, options))
+    }
+
+    /// Open the document once, warm its document-wide lazy state on the
+    /// calling thread, then process the remaining pages on the rayon pool
+    /// against the shared, `Sync` [`PdfDocument`].
+    ///
+    /// Previously each worker opened its own `PdfDocument` for a batch of
+    /// pages. The first page of every batch then paid the one-off
+    /// document-wide work again (structure-tree parse, running
+    /// header/footer scan over every page — ~290 ms on a 300-page tagged
+    /// PDF), so throughput plateaued at ~1.5× regardless of thread count.
+    /// Warming page 0 outside the pool lets that scan use the pool itself
+    /// (it runs sequentially when already on a worker, see
+    /// `ensure_running_artifact_signatures`) and the per-page work then
+    /// scales with the number of workers.
+    fn run_shared<F>(path: &Path, per_page: F) -> Result<Vec<String>>
+    where
+        F: Fn(&PdfDocument, usize) -> Result<String> + Sync,
+    {
+        let doc = PdfDocument::open(path)?;
+        let page_count = doc.page_count()?;
         if page_count == 0 {
             return Ok(Vec::new());
         }
-        let path_buf = path.to_path_buf();
-        let options = options.clone();
-
-        let num_threads = rayon::current_num_threads().max(1);
-        let batch_size = page_count.div_ceil(num_threads);
-        let batches: Vec<(usize, usize)> = (0..page_count)
-            .step_by(batch_size)
-            .map(|start| (start, (start + batch_size).min(page_count)))
-            .collect();
-
-        let batch_results: std::result::Result<Vec<Vec<(usize, String)>>, Error> = batches
+        let first = per_page(&doc, 0)?;
+        let rest: Vec<String> = (1..page_count)
             .into_par_iter()
-            .map(|(start, end)| {
-                let doc = PdfDocument::open(&path_buf)?;
-                let mut results = Vec::with_capacity(end - start);
-                for page_index in start..end {
-                    let md = doc.to_markdown(page_index, &options)?;
-                    results.push((page_index, md));
-                }
-                Ok(results)
-            })
-            .collect();
-
-        let mut all_results: Vec<(usize, String)> = batch_results?.into_iter().flatten().collect();
-        all_results.sort_unstable_by_key(|(idx, _)| *idx);
-        Ok(all_results.into_iter().map(|(_, md)| md).collect())
+            .map(|page_index| per_page(&doc, page_index))
+            .collect::<Result<Vec<String>>>()?;
+        let mut all = Vec::with_capacity(page_count);
+        all.push(first);
+        all.extend(rest);
+        Ok(all)
     }
 
-    /// Determine the page count by opening the document once.
-    fn get_page_count(path: &Path) -> Result<usize> {
-        let doc = PdfDocument::open(path)?;
-        doc.page_count()
-    }
 }
 
 /// Convenience function: extract plain text from all pages in parallel.
