@@ -539,6 +539,10 @@ pub struct PdfDocument {
     /// structured, reading-order and table paths each re-parse the content
     /// stream otherwise; this serves the repeat parses from one extraction.
     page_raw_spans_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
+    /// Serialises the document-wide one-off scans so concurrent callers on a
+    /// shared document wait for one computation instead of repeating it.
+    signatures_compute_lock: Mutex<()>,
+    struct_tree_compute_lock: Mutex<()>,
     /// Per-page lightweight search index (page text + span bounding boxes,
     /// no fonts/glyph widths) built lazily by `search()`/`search_page()` and
     /// reused across repeated calls on the same document. Unlike
@@ -1310,6 +1314,8 @@ impl PdfDocument {
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
             page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
             page_raw_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
+            signatures_compute_lock: Mutex::new(()),
+            struct_tree_compute_lock: Mutex::new(()),
             search_index: Mutex::new(HashMap::new()),
             page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
@@ -4150,6 +4156,10 @@ impl PdfDocument {
         match cached {
             Some(tree) => tree,
             None => {
+                let _compute_guard = self.struct_tree_compute_lock.lock_or_recover();
+                if let Some(tree) = self.structure_tree_cache.lock_or_recover().clone() {
+                    return tree;
+                }
                 let has_struct_tree_root = self
                     .catalog()
                     .ok()
@@ -4187,6 +4197,10 @@ impl PdfDocument {
         match cached {
             Some(tree) => tree,
             None => {
+                let _compute_guard = self.struct_tree_compute_lock.lock_or_recover();
+                if let Some(tree) = self.structure_tree_cache.lock_or_recover().clone() {
+                    return tree;
+                }
                 let mark = self.mark_info().unwrap_or_default();
                 let has_struct_tree_root = self
                     .catalog()
@@ -16864,6 +16878,13 @@ impl PdfDocument {
                 return Ok(std::sync::Arc::clone(map));
             }
         }
+        let _compute_guard = self.signatures_compute_lock.lock_or_recover();
+        {
+            let guard = self.running_artifact_signatures.lock_or_recover();
+            if let Some(ref map) = *guard {
+                return Ok(std::sync::Arc::clone(map));
+            }
+        }
         let page_count = self.page_count()?;
         if page_count < 2 {
             let empty = std::sync::Arc::new(std::collections::HashMap::new());
@@ -16899,14 +16920,44 @@ impl PdfDocument {
             String,
             Vec<(usize, crate::geometry::Rect, String)>,
         > = std::collections::HashMap::new();
-        for pi in 0..page_count {
-            let spans = match self.extract_spans_raw(pi) {
-                Ok(s) => s,
-                Err(_) => continue,
+        // Page scan: the per-page extraction is independent, so (when not
+        // already running on a rayon worker, where a nested pool wait could
+        // steal an outer task that re-enters here) fetch it in parallel in
+        // bounded chunks; the aggregation below stays sequential.
+        let fetch = |pi: usize| -> Option<(Vec<crate::layout::TextSpan>, f32, f32)> {
+            let spans = self.extract_spans_raw_uncached(pi).ok()?;
+            match self.get_page_media_box(pi) {
+                Ok((_, _, w, h)) if h > 0.0 => Some((spans, w, h)),
+                _ => None,
+            }
+        };
+        const SCAN_CHUNK: usize = 32;
+        #[cfg(feature = "parallel")]
+        let parallel_scan = rayon::current_thread_index().is_none();
+        #[cfg(not(feature = "parallel"))]
+        let parallel_scan = false;
+        let mut chunk_start = 0;
+        while chunk_start < page_count {
+            let chunk_end = (chunk_start + SCAN_CHUNK).min(page_count);
+            let pre: Vec<Option<(Vec<crate::layout::TextSpan>, f32, f32)>> = if parallel_scan {
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::*;
+                    (chunk_start..chunk_end).into_par_iter().map(fetch).collect()
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    (chunk_start..chunk_end).map(fetch).collect()
+                }
+            } else {
+                (chunk_start..chunk_end).map(fetch).collect()
             };
-            let (page_width, page_height) = match self.get_page_media_box(pi) {
-                Ok((_, _, w, h)) if h > 0.0 => (w, h),
-                _ => continue,
+            let this_chunk_start = chunk_start;
+            chunk_start = chunk_end;
+        for (off, item) in pre.into_iter().enumerate() {
+            let pi = this_chunk_start + off;
+            let Some((spans, page_width, page_height)) = item else {
+                continue;
             };
             let vertical = Self::page_is_vertical(&spans);
             // Require that the page has CONTENT outside the chrome band(s)
@@ -16960,6 +17011,7 @@ impl PdfDocument {
                     entry.1 = pi;
                 }
             }
+        }
         }
 
         Self::ensure_position_consistency(
@@ -21429,6 +21481,11 @@ impl PdfDocument {
             match cached {
                 Some(tree) => tree,
                 None => {
+                    let _compute_guard = self.struct_tree_compute_lock.lock_or_recover();
+                    let recheck = self.structure_tree_cache.lock_or_recover().clone();
+                    if let Some(tree) = recheck {
+                        tree
+                    } else {
                     let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
                     let has_struct_tree_root = !is_marked
                         && self
@@ -21443,6 +21500,7 @@ impl PdfDocument {
                     };
                     *self.structure_tree_cache.lock_or_recover() = Some(tree.clone());
                     tree
+                    }
                 },
             }
         };
