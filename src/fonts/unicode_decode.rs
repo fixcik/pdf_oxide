@@ -390,8 +390,8 @@ pub(crate) fn char_codes_with_widths(bytes: &[u8], font: &FontInfo) -> Vec<(u32,
     }
 }
 
-/// Allocation-free variant of `resolve_char` + the `\u{FFFD}` filter used by
-/// the decode loops: appends straight into `out`.
+/// Resolve one character code and append it straight into `out` (applying the
+/// `\u{FFFD}` filter used by the decode loops) without an intermediate `String`.
 fn push_resolved(font: &FontInfo, code: u32, policy: DecodePolicy, out: &mut String) {
     let handled = font.char_to_unicode_with(code, |hit| match hit {
         Some(s) => {
@@ -412,16 +412,6 @@ fn push_resolved(font: &FontInfo, code: u32, policy: DecodePolicy, out: &mut Str
             out.push_str(&s);
         }
     }
-}
-
-fn resolve_char(font: &FontInfo, code: u32, policy: DecodePolicy) -> String {
-    if let Some(char_str) = font.char_to_unicode(code) {
-        return char_str;
-    }
-    if char::from_u32(code).is_none() && !policy.question_mark_for_invalid {
-        return "\u{FFFD}".to_string();
-    }
-    fallback_char_to_unicode(code)
 }
 
 pub(crate) fn decode_text_to_unicode(

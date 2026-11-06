@@ -32,7 +32,6 @@ pub struct Std14Flags {
     pub is_italic: bool,
 }
 
-/// Font information extracted from a PDF font dictionary.
 /// Shared per-font `char_to_unicode` memo. The unique `id` keys a per-thread
 /// cache so hot decode loops never touch a shared lock or cache line.
 #[derive(Debug)]
@@ -55,6 +54,7 @@ thread_local! {
 }
 const TL_UNICODE_MEMO_MAX: usize = 200_000;
 
+/// Font information extracted from a PDF font dictionary.
 #[derive(Debug, Clone)]
 pub struct FontInfo {
     /// Base font name (e.g., "Times-Roman", "Helvetica-Bold")

@@ -38,10 +38,10 @@ use crate::error::Result;
 
 /// Parallel extractor that processes PDF pages across multiple threads.
 ///
-/// Uses a batched strategy: divides pages into chunks and each rayon worker
-/// opens a single [`PdfDocument`] instance to process its chunk sequentially.
-/// This amortizes the cost of document opening, xref parsing, page tree walks,
-/// and font loading across many pages instead of paying it per-page.
+/// Opens the document once, warms its document-wide lazy state on the calling
+/// thread (structure tree, running header/footer scan), and then processes the
+/// remaining pages in parallel against the shared [`PdfDocument`]. This pays the
+/// one-time per-document cost once instead of once per worker.
 ///
 /// All results are returned in page order regardless of which thread processed
 /// each page.
@@ -50,9 +50,9 @@ pub struct ParallelExtractor;
 impl ParallelExtractor {
     /// Extract plain text from every page of a PDF in parallel.
     ///
-    /// Opens the document once on the calling thread to determine the page count,
-    /// then divides pages into batches distributed across rayon worker threads.
-    /// Each worker opens a single `PdfDocument` and extracts all pages in its batch.
+    /// Opens the document once, warms it on the calling thread by extracting the
+    /// first page, then extracts the remaining pages across rayon worker threads
+    /// sharing that single `PdfDocument`.
     ///
     /// Returns a `Vec<String>` with one entry per page, in page order.
     ///
@@ -74,6 +74,14 @@ impl ParallelExtractor {
         Self::run_shared(path, |doc, page_index| doc.extract_text(page_index))
     }
 
+    /// Convert every page of a PDF to Markdown in parallel.
+    ///
+    /// Uses the same shared, warmed document as [`extract_all_text`](Self::extract_all_text).
+    /// Returns one Markdown string per page, in page order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error encountered by any worker.
     pub fn extract_all_markdown(path: &Path, options: &ConversionOptions) -> Result<Vec<String>> {
         Self::run_shared(path, |doc, page_index| doc.to_markdown(page_index, options))
     }
@@ -110,7 +118,6 @@ impl ParallelExtractor {
         all.extend(rest);
         Ok(all)
     }
-
 }
 
 /// Convenience function: extract plain text from all pages in parallel.

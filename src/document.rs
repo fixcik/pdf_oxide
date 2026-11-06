@@ -542,7 +542,8 @@ pub struct PdfDocument {
     /// Raw (pre-`postprocess_spans`) default-config spans per page. The
     /// structured, reading-order and table paths each re-parse the content
     /// stream otherwise; this serves the repeat parses from one extraction.
-    page_raw_spans_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
+    page_raw_spans_cache:
+        Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
     /// Serialises the document-wide one-off scans so concurrent callers on a
     /// shared document wait for one computation instead of repeating it.
     signatures_compute_lock: Mutex<()>,
@@ -2471,12 +2472,9 @@ impl PdfDocument {
                 // clobber a real object loaded through the normal path.
                 let is_null_or_absent =
                     matches!(cache.get(&cache_ref).as_deref(), Some(Object::Null) | None);
-                match is_null_or_absent {
-                    true => {
-                        cache.insert(cache_ref, object);
-                        recovered += 1;
-                    },
-                    _ => {},
+                if is_null_or_absent {
+                    cache.insert(cache_ref, object);
+                    recovered += 1;
                 }
             }
         }
@@ -7448,9 +7446,6 @@ impl PdfDocument {
         Ok(result)
     }
 
-    /// Mark a specific rectangular region on a page for erasure.
-    ///
-    /// Content in this region will be excluded from all subsequent text extractions.
     /// Enable or disable the per-character refinement of
     /// [`TextSpan::char_x_offsets`](crate::layout::TextSpan::char_x_offsets).
     ///
@@ -7468,6 +7463,9 @@ impl PdfDocument {
         self.search_index.lock_or_recover().clear();
     }
 
+    /// Mark a specific rectangular region on a page for erasure.
+    ///
+    /// Content in this region will be excluded from all subsequent text extractions.
     pub fn erase_region(&self, page_index: usize, rect: crate::geometry::Rect) -> Result<()> {
         self.erase_regions
             .lock_or_recover()
@@ -16990,7 +16988,10 @@ impl PdfDocument {
                 #[cfg(feature = "parallel")]
                 {
                     use rayon::prelude::*;
-                    (chunk_start..chunk_end).into_par_iter().map(fetch).collect()
+                    (chunk_start..chunk_end)
+                        .into_par_iter()
+                        .map(fetch)
+                        .collect()
                 }
                 #[cfg(not(feature = "parallel"))]
                 {
@@ -17001,64 +17002,64 @@ impl PdfDocument {
             };
             let this_chunk_start = chunk_start;
             chunk_start = chunk_end;
-        for (off, item) in pre.into_iter().enumerate() {
-            let pi = this_chunk_start + off;
-            let Some((spans, page_width, page_height)) = item else {
-                continue;
-            };
-            let vertical = Self::page_is_vertical(&spans);
-            // Require that the page has CONTENT outside the chrome band(s)
-            // before counting band spans as candidate artifacts. Otherwise, a
-            // page consisting only of a title near the top would have its own
-            // title classified as a "running header" across all pages. (For
-            // horizontal pages this is identical to the prior top/bottom test.)
-            let has_body_content = spans.iter().any(|s| {
-                !s.text.trim().is_empty()
-                    && !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
-            });
-            if has_body_content {
-                body_content_pages.insert(pi);
-            }
-            let mut seen_this_page: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for s in spans.iter() {
-                let trimmed = s.text.trim();
-                if trimmed.is_empty() {
+            for (off, item) in pre.into_iter().enumerate() {
+                let pi = this_chunk_start + off;
+                let Some((spans, page_width, page_height)) = item else {
+                    continue;
+                };
+                let vertical = Self::page_is_vertical(&spans);
+                // Require that the page has CONTENT outside the chrome band(s)
+                // before counting band spans as candidate artifacts. Otherwise, a
+                // page consisting only of a title near the top would have its own
+                // title classified as a "running header" across all pages. (For
+                // horizontal pages this is identical to the prior top/bottom test.)
+                let has_body_content = spans.iter().any(|s| {
+                    !s.text.trim().is_empty()
+                        && !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
+                });
+                if has_body_content {
+                    body_content_pages.insert(pi);
+                }
+                let mut seen_this_page: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for s in spans.iter() {
+                    let trimmed = s.text.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical) {
+                        continue;
+                    }
+                    let sig = Self::normalize_artifact_signature(trimmed);
+                    if sig.is_empty() || sig.chars().count() < 2 {
+                        continue;
+                    }
+                    signature_positions.entry(sig.clone()).or_default().push((
+                        pi,
+                        s.bbox,
+                        trimmed.to_string(),
+                    ));
+                    seen_this_page
+                        .entry(sig)
+                        .or_insert_with(|| trimmed.to_string());
+                }
+                for (sig, literal) in &seen_this_page {
+                    literal_variants
+                        .entry(sig.clone())
+                        .or_default()
+                        .insert(literal.clone());
+                }
+                if !has_body_content {
                     continue;
                 }
-                if !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical) {
-                    continue;
-                }
-                let sig = Self::normalize_artifact_signature(trimmed);
-                if sig.is_empty() || sig.chars().count() < 2 {
-                    continue;
-                }
-                signature_positions.entry(sig.clone()).or_default().push((
-                    pi,
-                    s.bbox,
-                    trimmed.to_string(),
-                ));
-                seen_this_page
-                    .entry(sig)
-                    .or_insert_with(|| trimmed.to_string());
-            }
-            for (sig, literal) in &seen_this_page {
-                literal_variants
-                    .entry(sig.clone())
-                    .or_default()
-                    .insert(literal.clone());
-            }
-            if !has_body_content {
-                continue;
-            }
-            for sig in seen_this_page.into_keys() {
-                let entry = occurrences.entry(sig).or_insert((0, pi));
-                entry.0 += 1;
-                if pi < entry.1 {
-                    entry.1 = pi;
+                for sig in seen_this_page.into_keys() {
+                    let entry = occurrences.entry(sig).or_insert((0, pi));
+                    entry.0 += 1;
+                    if pi < entry.1 {
+                        entry.1 = pi;
+                    }
                 }
             }
-        }
         }
 
         Self::ensure_position_consistency(
@@ -17252,7 +17253,10 @@ impl PdfDocument {
         Ok(spans)
     }
 
-    fn extract_spans_raw_uncached(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
+    fn extract_spans_raw_uncached(
+        &self,
+        page_index: usize,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
         self.extract_spans_raw_with_extraction_config(
             page_index,
             crate::extractors::TextExtractionConfig::default(),
@@ -21533,20 +21537,22 @@ impl PdfDocument {
                     if let Some(tree) = recheck {
                         tree
                     } else {
-                    let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
-                    let has_struct_tree_root = !is_marked
-                        && self
-                            .catalog()
-                            .ok()
-                            .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
-                            .unwrap_or(false);
-                    let tree = if is_marked || has_struct_tree_root {
-                        self.structure_tree().ok().flatten().map(Arc::new)
-                    } else {
-                        None
-                    };
-                    *self.structure_tree_cache.lock_or_recover() = Some(tree.clone());
-                    tree
+                        let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
+                        let has_struct_tree_root = !is_marked
+                            && self
+                                .catalog()
+                                .ok()
+                                .and_then(|cat| {
+                                    cat.as_dict().map(|d| d.contains_key("StructTreeRoot"))
+                                })
+                                .unwrap_or(false);
+                        let tree = if is_marked || has_struct_tree_root {
+                            self.structure_tree().ok().flatten().map(Arc::new)
+                        } else {
+                            None
+                        };
+                        *self.structure_tree_cache.lock_or_recover() = Some(tree.clone());
+                        tree
                     }
                 },
             }
