@@ -17646,13 +17646,16 @@ impl PdfDocument {
         page_index: usize,
         column_mode: crate::structured::ColumnMode,
     ) -> Result<crate::structured::StructuredPage> {
-        let page_text = self.extract_page_text(page_index)?;
+        // Same spans/dimensions `extract_page_text` would produce, minus the
+        // per-character `TextChar` expansion it builds and this path never reads.
+        let spans = self.extract_spans_with_reading_order(page_index, ReadingOrder::default())?;
+        let media_box = self.get_page_media_box(page_index)?;
         let struct_info = self.structured_mcid_info(page_index);
         Ok(crate::structured::build_structured_page_full(
             page_index,
-            page_text.page_width,
-            page_text.page_height,
-            page_text.spans,
+            media_box.2,
+            media_box.3,
+            spans,
             column_mode,
             &struct_info,
         ))
