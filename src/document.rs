@@ -161,7 +161,10 @@ pub(crate) use crate::cache::BoundedEntryCache;
 /// insert-once-read-once — higher-level caches (font caches, xobject stream
 /// cache) serve repeated lookups, so recency is not a useful signal here.
 struct BoundedObjectCache {
-    map: HashMap<ObjectRef, Object>,
+    /// `Arc` so a cache hit clones a pointer under the lock and the deep
+    /// `Object` clone happens outside it (the page dictionary is re-read
+    /// many times per page; cloning it under the mutex serialised threads).
+    map: HashMap<ObjectRef, Arc<Object>>,
     insertion_order: std::collections::VecDeque<ObjectRef>,
     current_bytes: usize,
     max_bytes: usize,
@@ -194,12 +197,13 @@ impl BoundedObjectCache {
         self.insert(key, value);
     }
 
-    fn get(&self, key: &ObjectRef) -> Option<&Object> {
-        self.map.get(key)
+    fn get(&self, key: &ObjectRef) -> Option<Arc<Object>> {
+        self.map.get(key).cloned()
     }
 
     fn insert(&mut self, key: ObjectRef, value: Object) {
         let entry_size = Self::estimate_size(&value);
+        let value = Arc::new(value);
 
         // Don't cache objects that alone exceed the budget
         if entry_size > self.max_bytes {
@@ -278,7 +282,7 @@ impl BoundedObjectCache {
         let pinned = std::mem::take(&mut self.pinned);
         self.map.retain(|k, _| pinned.contains(k));
         self.insertion_order.retain(|k| pinned.contains(k));
-        self.current_bytes = self.map.values().map(Self::estimate_size).sum();
+        self.current_bytes = self.map.values().map(|v| Self::estimate_size(v)).sum();
         self.pinned = pinned;
     }
 
@@ -2461,8 +2465,10 @@ impl PdfDocument {
                 // Only overwrite entries we'd otherwise have resolved to
                 // Null (the free-entry short-circuit caches Null). Never
                 // clobber a real object loaded through the normal path.
-                match cache.get(&cache_ref) {
-                    Some(Object::Null) | None => {
+                let is_null_or_absent =
+                    matches!(cache.get(&cache_ref).as_deref(), Some(Object::Null) | None);
+                match is_null_or_absent {
+                    true => {
                         cache.insert(cache_ref, object);
                         recovered += 1;
                     },
@@ -2540,9 +2546,9 @@ impl PdfDocument {
         }
 
         // Check cache first (warm path: fully parallel, no serialization).
-        let cached_opt = self.object_cache.lock_or_recover().get(&obj_ref).cloned();
-        if let Some(cached) = cached_opt {
-            return Ok(cached);
+        let cached_arc = self.object_cache.lock_or_recover().get(&obj_ref);
+        if let Some(cached) = cached_arc {
+            return Ok((*cached).clone());
         }
 
         // Cold path (#507): serialize uncached loads across threads so a
@@ -2556,7 +2562,8 @@ impl PdfDocument {
             let guard = self.load_lock.lock_or_recover();
             // Double-checked: another thread may have loaded and cached
             // this object while we were blocked on the guard.
-            if let Some(cached) = self.object_cache.lock_or_recover().get(&obj_ref).cloned() {
+            let cached_arc = self.object_cache.lock_or_recover().get(&obj_ref);
+            if let Some(cached) = cached_arc.map(|a| (*a).clone()) {
                 return Ok(cached);
             }
             Some(guard)
@@ -2668,7 +2675,8 @@ impl PdfDocument {
             // mis-flag every compressed object's xref slot as free, so
             // sweep the object streams once and recheck the cache.
             self.recover_from_object_streams();
-            if let Some(obj) = self.object_cache.lock_or_recover().get(&obj_ref).cloned() {
+            let recovered_arc = self.object_cache.lock_or_recover().get(&obj_ref);
+            if let Some(obj) = recovered_arc.map(|a| (*a).clone()) {
                 if !matches!(obj, Object::Null) {
                     log::debug!("Object {} recovered from object-stream sweep", obj_ref.id);
                     return Ok(obj);
@@ -2844,7 +2852,8 @@ impl PdfDocument {
         }
 
         // If already in object cache, check directly
-        let cached_opt = self.object_cache.lock_or_recover().get(&obj_ref).cloned();
+        let cached_arc = self.object_cache.lock_or_recover().get(&obj_ref);
+        let cached_opt = cached_arc.map(|a| (*a).clone());
         if let Some(cached) = cached_opt {
             let is_form = cached
                 .as_dict()
