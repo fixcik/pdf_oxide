@@ -335,6 +335,44 @@ thread_local! {
     static RECURSION_DEPTH: RefCell<u32> = const { RefCell::new(0) };
 }
 
+/// Marks `obj_ref` as being resolved on this thread for the guard's lifetime.
+///
+/// The push happens in `new` and the pop in `Drop`, so the per-thread state is
+/// restored on every exit path, including a panic that unwinds through
+/// `load_object`. Without it a caught panic left the ref on the stack and the
+/// depth raised, so later loads on a reused (pool) thread failed with a false
+/// `CircularReference`, skipped the depth-0 `load_lock`, and after enough
+/// leaks hit `RecursionLimitExceeded` on every load.
+struct ResolvingGuard(ObjectRef);
+
+impl ResolvingGuard {
+    fn new(obj_ref: ObjectRef) -> Self {
+        RESOLVING_STACK.with(|s| {
+            s.borrow_mut().insert(obj_ref);
+        });
+        RECURSION_DEPTH.with(|d| *d.borrow_mut() += 1);
+        Self(obj_ref)
+    }
+}
+
+impl Drop for ResolvingGuard {
+    fn drop(&mut self) {
+        RECURSION_DEPTH.with(|d| {
+            let mut d = d.borrow_mut();
+            *d = d.saturating_sub(1);
+        });
+        RESOLVING_STACK.with(|s| {
+            s.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: `load_object` panics while resolving this object id.
+    static PANIC_ON_LOAD: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// One registered running-header/footer signature: the earliest page it was
 /// observed on (kept intact — often a cover-page title echoed by later
 /// pages), and every `(page, bbox)` it was recorded at. The latter backs
@@ -2598,20 +2636,10 @@ impl PdfDocument {
                         );
 
                         // Mark as being resolved (per-thread cycle detection)
-                        RESOLVING_STACK.with(|s| {
-                            s.borrow_mut().insert(obj_ref);
-                        });
-                        RECURSION_DEPTH.with(|d| *d.borrow_mut() += 1);
+                        let _resolving = ResolvingGuard::new(obj_ref);
 
                         // Load the object
-                        let result = self.load_uncompressed_object(obj_ref, offset);
-
-                        RECURSION_DEPTH.with(|d| *d.borrow_mut() -= 1);
-                        RESOLVING_STACK.with(|s| {
-                            s.borrow_mut().remove(&obj_ref);
-                        });
-
-                        return result;
+                        return self.load_uncompressed_object(obj_ref, offset);
                     },
                     Err(_) => {
                         // PDF Spec §7.3.10: missing object reference "shall be treated as null"
@@ -2660,16 +2688,8 @@ impl PdfDocument {
                     obj_ref.id,
                     scanned_offset
                 );
-                RESOLVING_STACK.with(|s| {
-                    s.borrow_mut().insert(obj_ref);
-                });
-                RECURSION_DEPTH.with(|d| *d.borrow_mut() += 1);
-                let result = self.load_uncompressed_object(obj_ref, scanned_offset);
-                RECURSION_DEPTH.with(|d| *d.borrow_mut() -= 1);
-                RESOLVING_STACK.with(|s| {
-                    s.borrow_mut().remove(&obj_ref);
-                });
-                return result;
+                let _resolving = ResolvingGuard::new(obj_ref);
+                return self.load_uncompressed_object(obj_ref, scanned_offset);
             }
 
             // Recovery path 2 — the object may be compressed inside a
@@ -2698,10 +2718,12 @@ impl PdfDocument {
         }
 
         // Mark as being resolved (per-thread cycle detection)
-        RESOLVING_STACK.with(|s| {
-            s.borrow_mut().insert(obj_ref);
-        });
-        RECURSION_DEPTH.with(|d| *d.borrow_mut() += 1);
+        let _resolving = ResolvingGuard::new(obj_ref);
+
+        #[cfg(test)]
+        if PANIC_ON_LOAD.with(|p| p.get()) == Some(obj_ref.id) {
+            panic!("test hook: panic while loading object {}", obj_ref.id);
+        }
 
         // Handle different entry types
         use crate::xref::XRefEntryType;
@@ -2738,11 +2760,6 @@ impl PdfDocument {
                 Ok(Object::Null)
             },
         };
-
-        RECURSION_DEPTH.with(|d| *d.borrow_mut() -= 1);
-        RESOLVING_STACK.with(|s| {
-            s.borrow_mut().remove(&obj_ref);
-        });
 
         result
     }
@@ -34626,5 +34643,77 @@ mod soft_hyphen_seam_tests {
             "0.59 em is band jitter, not a line advance"
         );
         assert_eq!(PdfDocument::soft_hyphen_seam(em, 0.0, 0.0), SoftHyphenSeam::Contiguous);
+    }
+}
+
+#[cfg(test)]
+mod panic_reuse_tests {
+    use super::*;
+
+    fn one_page_pdf(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 12 Tf 72 700 Td ({text}) Tj ET");
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offs = Vec::new();
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_string(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_string(),
+        ];
+        for (i, body) in objs.iter().enumerate() {
+            offs.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for o in offs {
+            pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    fn page_text(doc: &PdfDocument) -> String {
+        let page = doc.extract_structured(0).expect("extract_structured");
+        page.regions
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A panic that unwinds out of `load_object` must not leave the per-thread
+    /// resolving state dirty: the next document parsed on the same thread (a
+    /// reused pool thread in a long-running service) must extract normally.
+    #[test]
+    fn panic_inside_extraction_leaves_thread_reusable() {
+        let fresh = std::thread::spawn(|| {
+            page_text(&PdfDocument::from_bytes(one_page_pdf("SECOND")).unwrap())
+        })
+        .join()
+        .unwrap();
+        assert!(fresh.contains("SECOND"), "baseline: {fresh:?}");
+
+        let first = PdfDocument::from_bytes(one_page_pdf("FIRST")).unwrap();
+        // Panic while the content stream (object 4) is being resolved, i.e.
+        // with the guard for it (and its parents) on the stack.
+        PANIC_ON_LOAD.with(|p| p.set(Some(4)));
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.extract_structured(0)));
+        PANIC_ON_LOAD.with(|p| p.set(None));
+        assert!(caught.is_err(), "the test hook must have fired");
+
+        assert_eq!(RECURSION_DEPTH.with(|d| *d.borrow()), 0);
+        assert!(RESOLVING_STACK.with(|s| s.borrow().is_empty()));
+
+        // Same object numbers as the panicked document, same thread.
+        let second = PdfDocument::from_bytes(one_page_pdf("SECOND")).unwrap();
+        assert_eq!(page_text(&second), fresh);
     }
 }
