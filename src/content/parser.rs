@@ -175,8 +175,9 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
 /// `Object::Real` for each numeric operand. Common operators like `m`, `l`, `c`,
 /// `re`, `cm`, `rg` are parsed entirely from raw bytes.
 pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
-    // Inside BT…ET only colour operators are kept: colour is graphics state
-    // and outlives ET (BT/ET do not save/restore it).
+    // Inside BT…ET only colour operators and q/Q are kept: colour is graphics
+    // state and outlives ET (BT/ET do not save/restore it), and q/Q inside a
+    // text object (not allowed, but seen in real files) still scope it.
     let mut in_text = false;
     let estimated_capacity = data.len() / 20;
     let mut operators = Vec::with_capacity(estimated_capacity.min(100_000));
@@ -205,7 +206,9 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                     i + 1 >= len || BYTE_CLASS[data[i + 1] as usize] != SCAN_ALPHA;
 
                 // Fast path: zero-operand single-char operators
-                if second_is_non_alpha && (!in_text || matches!(first_byte, b'g' | b'G')) {
+                if second_is_non_alpha
+                    && (!in_text || matches!(first_byte, b'g' | b'G' | b'q' | b'Q'))
+                {
                     let operands = &data[operand_start..i];
                     let op = match first_byte {
                         // Path painting (zero operands)
