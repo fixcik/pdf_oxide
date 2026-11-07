@@ -87,7 +87,10 @@ const MAX_CONSECUTIVE_ERRORS: usize = 1024;
 #[inline]
 fn push_operator_cap_warning() {
     let cap = effective_max_operators();
-    let msg = format!("Content stream exceeded {cap} operators, truncating");
+    push_cap_warning(format!("Content stream exceeded {cap} operators, truncating"));
+}
+
+fn push_cap_warning(msg: String) {
     log::warn!("{msg}");
     crate::extractors::warnings::push_global_warning(crate::extractors::warnings::Warning {
         category: crate::extractors::warnings::WarningCategory::OperatorCapExceeded,
@@ -105,6 +108,46 @@ fn push_operator_cap_warning() {
 /// Includes safety limits: bails out after `MAX_OPERATORS` operators or
 /// `MAX_CONSECUTIVE_ERRORS` consecutive parse failures.
 pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
+    parse_content_stream_capped(data, false)
+}
+
+/// [`parse_content_stream`] for text extraction: past the operator cap it
+/// keeps parsing instead of truncating, dropping only path construction,
+/// painting and clipping operators, so text drawn after a huge vector figure
+/// is not lost. The operators kept are still bounded, at twice the cap.
+pub(crate) fn parse_content_stream_for_text(data: &[u8]) -> Result<Vec<Operator>> {
+    parse_content_stream_capped(data, true)
+}
+
+/// Path construction, painting and clipping operators (ISO 32000-1 §8.5).
+fn is_path_operator(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::MoveTo { .. }
+            | Operator::LineTo { .. }
+            | Operator::CurveTo { .. }
+            | Operator::CurveToV { .. }
+            | Operator::CurveToY { .. }
+            | Operator::ClosePath
+            | Operator::Rectangle { .. }
+            | Operator::Stroke
+            | Operator::Fill
+            | Operator::FillEvenOdd
+            | Operator::CloseAndStroke
+            | Operator::CloseFillStroke
+            | Operator::FillStroke
+            | Operator::FillStrokeEvenOdd
+            | Operator::CloseFillStrokeEvenOdd
+            | Operator::EndPath
+            | Operator::ClipNonZero
+            | Operator::ClipEvenOdd
+    )
+}
+
+fn parse_content_stream_capped(data: &[u8], keep_text_past_cap: bool) -> Result<Vec<Operator>> {
+    let cap = effective_max_operators();
+    let mut limit = cap;
+    let mut past_cap = false;
     let estimated_capacity = data.len() / 20;
     let mut operators = Vec::with_capacity(estimated_capacity.min(100_000));
     let mut input = data;
@@ -125,12 +168,26 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
         // Parse one operator with its operands
         match parse_operator_with_operands(input) {
             Ok((rest, op)) => {
-                operators.push(op);
                 input = rest;
                 consecutive_errors = 0;
+                if past_cap && is_path_operator(&op) {
+                    continue;
+                }
+                operators.push(op);
 
-                if operators.len() >= effective_max_operators() {
-                    push_operator_cap_warning();
+                if operators.len() >= limit {
+                    if keep_text_past_cap && !past_cap {
+                        past_cap = true;
+                        limit = cap.saturating_mul(2);
+                        push_cap_warning(format!(
+                            "Content stream exceeded {cap} operators, dropping further \
+                             path operators"
+                        ));
+                        continue;
+                    }
+                    push_cap_warning(format!(
+                        "Content stream exceeded {limit} operators, truncating"
+                    ));
                     break;
                 }
             },

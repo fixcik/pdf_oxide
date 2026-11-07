@@ -284,3 +284,31 @@ fn page_facts_follow_the_layer_filter_of_the_structured_call() {
     let _ = doc.extract_spans(0);
     assert_eq!(images(&doc), 0);
 }
+
+#[test]
+fn text_after_the_operator_cap_survives_with_facts_on() {
+    // A vector map larger than the 1,000,000-operator cap, then text. The full
+    // parser that visibility facts route through used to stop at the cap and
+    // drop the text silently (PMC4875632 page 2).
+    let mut content = b"BT /F1 12 Tf 72 720 Td (BeforeTheMap) Tj ET\n".to_vec();
+    for _ in 0..600_000 {
+        content.extend_from_slice(b"0 0 1 1 re f\n");
+    }
+    content.extend_from_slice(b"BT /F1 12 Tf 72 700 Td (AfterTheMap) Tj ET");
+    let bytes = pdf("", "", &content, &[]);
+    let text = |d: &PdfDocument| -> String {
+        d.extract_structured(0)
+            .unwrap()
+            .regions
+            .into_iter()
+            .map(|r| r.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let plain = text(&PdfDocument::from_bytes(bytes.clone()).unwrap());
+    assert!(plain.contains("AfterTheMap"), "{plain}");
+    let doc = open_with_facts(bytes);
+    let with = text(&doc);
+    assert!(with.contains("BeforeTheMap") && with.contains("AfterTheMap"), "{with}");
+    assert!(facts_of(&spans(&doc), "AfterTheMap").clip_coverage > 0.99);
+}

@@ -3610,7 +3610,7 @@ impl<'doc> TextExtractor<'doc> {
 
     fn run_content_stream(&mut self, content_stream: &[u8]) -> Result<()> {
         if self.has_emission_filter() {
-            let operators = parse_content_stream(content_stream)?;
+            let operators = crate::content::parser::parse_content_stream_for_text(content_stream)?;
             for op in operators {
                 self.execute_operator(op)?;
             }
