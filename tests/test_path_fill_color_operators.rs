@@ -29,7 +29,8 @@ BT /DeviceRGB cs 1 0 0 sc (x) Tj ET 200 0 10 10 re f\n\
 /CS2 cs 240 0 10 10 re f\n\
 /DeviceCMYK cs 260 0 10 10 re f\n\
 /Fm0 Do\n\
-/CS0 cs 1 1 1 scn BT 0.5 g ET 300 0 10 10 re f\n";
+/CS0 cs 1 1 1 scn BT 0.5 g ET 300 0 10 10 re f\n\
+0 0 1 rg BT q 1 g Q ET 320 0 10 10 re f\n";
     let objs: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
@@ -97,7 +98,7 @@ fn rgb(c: Option<Color>) -> Option<(f32, f32, f32)> {
 fn scn_sc_set_path_fill_colour_by_space_kind() {
     let doc = PdfDocument::from_bytes(fixture_pdf()).expect("parse fixture");
     let paths = doc.extract_paths(0).expect("extract paths");
-    assert_eq!(paths.len(), 16);
+    assert_eq!(paths.len(), 17);
 
     // ICCBased N=3 + scn -> white.
     assert_eq!(rgb(path_at(&paths, 0.0).fill_color), Some((1.0, 1.0, 1.0)));
@@ -133,4 +134,6 @@ fn scn_sc_set_path_fill_colour_by_space_kind() {
     assert_eq!(rgb(path_at(&paths, 280.0).fill_color), Some((0.0, 1.0, 1.0)));
     // A device colour set inside BT..ET replaces the earlier scn colour.
     assert_eq!(rgb(path_at(&paths, 300.0).fill_color), Some((0.5, 0.5, 0.5)));
+    // q ... Q inside BT..ET still restores the colour set before q.
+    assert_eq!(rgb(path_at(&paths, 320.0).fill_color), Some((0.0, 0.0, 1.0)));
 }
