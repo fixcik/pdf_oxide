@@ -312,3 +312,121 @@ fn text_after_the_operator_cap_survives_with_facts_on() {
     assert!(with.contains("BeforeTheMap") && with.contains("AfterTheMap"), "{with}");
     assert!(facts_of(&spans(&doc), "AfterTheMap").clip_coverage > 0.99);
 }
+
+fn span_of<'a>(spans: &'a [TextSpan], needle: &str) -> &'a TextSpan {
+    spans
+        .iter()
+        .find(|s| s.text.contains(needle))
+        .unwrap_or_else(|| panic!("no span with {needle:?}"))
+}
+
+fn is_rgb(c: Option<pdf_oxide::layout::Color>, rgb: (f32, f32, f32)) -> bool {
+    c.is_some_and(|c| {
+        (c.r - rgb.0).abs() < 1e-3 && (c.g - rgb.1).abs() < 1e-3 && (c.b - rgb.2).abs() < 1e-3
+    })
+}
+
+/// Colour spaces selected by resource name (`/Cs8 cs 1 scn`), as real files do.
+const NAMED_SPACES: &str = "/ColorSpace << \
+    /Cs8 [/Separation /Black /DeviceCMYK 6 0 R] \
+    /Cs9 [/Separation /PANTONE#20Red /DeviceRGB 7 0 R] \
+    /Cs10 [/Separation /Spot /DeviceGray 8 0 R] \
+    /Cs11 [/DeviceN [/Cyan /Magenta /Yellow /Black] /DeviceCMYK 6 0 R] \
+    /Cs12 [/Pattern] \
+    /Cs13 [/Indexed /DeviceRGB 1 <FF000000FF00>] >>";
+
+fn named_space_objects() -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0 0 1] /N 1 >>".into(),
+            Vec::new(),
+        ),
+        (
+            "<< /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [1 0 0] /N 1 >>".into(),
+            Vec::new(),
+        ),
+        (
+            "<< /FunctionType 4 /Domain [0 1] /Range [0 1] >>".into(),
+            b"{ 1 exch sub }".to_vec(),
+        ),
+    ]
+}
+
+#[test]
+fn fill_color_resolves_named_separation_and_devicen_spaces() {
+    let content = b"BT /F1 12 Tf /Cs8 cs 1 scn 72 700 Td (SEPBLACK) Tj ET\n\
+                    BT /F1 12 Tf /Cs9 cs 0.5 scn 72 670 Td (SPOTHALF) Tj ET\n\
+                    BT /F1 12 Tf /Cs10 cs 0.25 sc 72 640 Td (TYPEFOUR) Tj ET\n\
+                    BT /F1 12 Tf /Cs11 cs 0 0 0 1 scn 72 610 Td (DEVICEN) Tj ET\n\
+                    BT /F1 12 Tf 0 0 0 1 k 72 580 Td (PROCESSK) Tj ET\n\
+                    BT /F1 12 Tf /Cs12 cs /P0 scn 72 550 Td (PATTERNED) Tj ET\n\
+                    BT /F1 12 Tf /Nope cs 1 scn 72 520 Td (UNRESOLVED) Tj ET\n\
+                    BT /F1 12 Tf 0.5 g 72 490 Td (HALFGRAY) Tj ET\n\
+                    BT /F1 12 Tf /Cs9 cs 72 460 Td (INITIALTINT) Tj ET\n\
+                    BT /F1 12 Tf /Cs13 cs 1 sc 72 430 Td (INDEXED) Tj ET";
+    let bytes = pdf("", NAMED_SPACES, content, &named_space_objects());
+    let plain = spans(&PdfDocument::from_bytes(bytes.clone()).unwrap());
+    let s = spans(&open_with_facts(bytes));
+    // The span colour itself is unchanged (the count-based guess: white).
+    assert!(is_rgb(Some(span_of(&s, "SEPBLACK").color), (1.0, 1.0, 1.0)));
+    assert_eq!(span_of(&plain, "SEPBLACK").color, span_of(&s, "SEPBLACK").color);
+    assert!(is_rgb(facts_of(&s, "SEPBLACK").fill_color, (0.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "SPOTHALF").fill_color, (1.0, 0.5, 0.5)));
+    assert!(is_rgb(facts_of(&s, "TYPEFOUR").fill_color, (0.75, 0.75, 0.75)));
+    let k = span_of(&s, "PROCESSK");
+    assert_eq!(facts_of(&s, "PROCESSK").fill_color, Some(k.color));
+    assert_eq!(facts_of(&s, "DEVICEN").fill_color, Some(k.color));
+    assert_eq!(facts_of(&s, "PATTERNED").fill_color, None);
+    assert_eq!(facts_of(&s, "UNRESOLVED").fill_color, None);
+    assert!(is_rgb(facts_of(&s, "HALFGRAY").fill_color, (0.5, 0.5, 0.5)));
+    // §8.6.8: a Separation space starts at tint 1.0.
+    assert!(is_rgb(facts_of(&s, "INITIALTINT").fill_color, (1.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "INDEXED").fill_color, (0.0, 1.0, 0.0)));
+}
+
+#[test]
+fn fill_color_follows_q_and_resolves_path_fills() {
+    let content = b"0.5 g\n\
+                    q /Cs8 cs 1 scn BT /F1 12 Tf 72 700 Td (INSIDEQ) Tj ET Q\n\
+                    BT /F1 12 Tf 72 670 Td (AFTERQ) Tj ET\n\
+                    q /Cs9 cs 1 scn 60 290 300 30 re f Q\n\
+                    q /Cs12 cs /P0 scn 60 200 300 30 re f Q\n\
+                    60 100 300 30 re f";
+    let bytes = pdf("", NAMED_SPACES, content, &named_space_objects());
+    let doc = open_with_facts(bytes);
+    let s = spans(&doc);
+    assert!(is_rgb(facts_of(&s, "INSIDEQ").fill_color, (0.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "AFTERQ").fill_color, (0.5, 0.5, 0.5)));
+    let pv = doc.page_visibility(0).expect("page facts");
+    let rects: Vec<_> = pv
+        .paints
+        .iter()
+        .filter(|p| p.kind == PaintKind::Rect)
+        .collect();
+    assert_eq!(rects.len(), 3);
+    assert!(is_rgb(rects[0].color, (1.0, 0.0, 0.0)));
+    assert_eq!(rects[1].color, None, "named Pattern space");
+    assert!(is_rgb(rects[2].color, (0.5, 0.5, 0.5)));
+}
+
+#[test]
+fn form_resolves_a_redefined_colour_space_name_against_its_own_resources() {
+    let content = b"BT /F1 12 Tf /Cs8 cs 1 scn 72 700 Td (PAGEBEFORE) Tj ET\n\
+                    /X0 Do\n\
+                    BT /F1 12 Tf /Cs8 cs 1 scn 72 600 Td (PAGEAFTER) Tj ET";
+    let res = "/ColorSpace << /Cs8 [/Separation /Black /DeviceCMYK 6 0 R] >> \
+               /XObject << /X0 8 0 R >>";
+    let mut extra = named_space_objects();
+    extra.truncate(2);
+    extra.push((
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> \
+         /ColorSpace << /Cs8 [/Separation /Spot /DeviceRGB 7 0 R] >> >> >>"
+            .to_string(),
+        b"BT /F1 12 Tf /Cs8 cs 1 scn 72 650 Td (INFORM) Tj ET".to_vec(),
+    ));
+    let s = spans(&open_with_facts(pdf("", res, content, &extra)));
+    assert!(is_rgb(facts_of(&s, "PAGEBEFORE").fill_color, (0.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "INFORM").fill_color, (1.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "PAGEAFTER").fill_color, (0.0, 0.0, 0.0)));
+}

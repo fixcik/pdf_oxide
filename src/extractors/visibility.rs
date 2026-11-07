@@ -16,11 +16,15 @@
 //! content; clip paths are tracked as the bbox of their points (curves by their
 //! control-point hull); a Form XObject without text is reported as one opaque
 //! [`PaintKind::Form`] event instead of being walked; strokes are not
-//! recorded; a fill in a named `/Pattern` colour space reports the last
-//! device colour instead of `None`.
+//! recorded. Fill colours of `Separation`/`DeviceN` spaces are evaluated only
+//! through Type 2 and Type 4 tint transforms (Type 0/3 give `None`).
 
 use crate::geometry::Rect;
 use crate::layout::Color;
+use crate::object::Object;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Visibility facts of one text span.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -45,6 +49,14 @@ pub struct SpanVisibility {
     /// [`PaintEvent::paint_order`]: a paint with a larger value was drawn on
     /// top of this span.
     pub paint_order: u32,
+    /// Resolved fill (non-stroking) colour the span was drawn with. Equals
+    /// the span's `color` in device-family spaces (`g`/`rg`/`k`, Device*,
+    /// Cal*, Lab, ICCBased); `Separation`, `DeviceN` and `Indexed` spaces
+    /// (literal or selected by resource name) are evaluated through their
+    /// tint transform / lookup table. `None` = unknown: a Pattern space, an
+    /// unresolvable colour-space name, an unsupported tint function or
+    /// alternate space, or the `/None` colorant.
+    pub fill_color: Option<Color>,
 }
 
 /// What a [`PaintEvent`] painted.
@@ -72,8 +84,9 @@ pub struct PaintEvent {
     pub kind: PaintKind,
     /// Painted area (already intersected with the clip), user space.
     pub bbox: Rect,
-    /// Fill colour for `Rect`/`Path` fills in a device/ICC colour space;
-    /// `None` for patterns, images, shadings and forms.
+    /// Fill colour for `Rect`/`Path` fills, resolved like
+    /// [`SpanVisibility::fill_color`]; `None` when it is unknown (Pattern
+    /// spaces, literal or named, included) and for images, shadings and forms.
     pub color: Option<Color>,
     /// Non-stroking alpha in effect (`/ca`).
     pub alpha: f32,
@@ -113,13 +126,378 @@ fn intersect(a: Bounds, b: Bounds) -> Bounds {
 }
 
 /// Inherited part of the graphics state the facts need (`q`/`Q` scoped).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct VisState {
     clip: Option<Bounds>,
     fill_alpha: f32,
     stroke_alpha: f32,
     soft_mask: bool,
     blend_non_normal: bool,
+    fill: Fill,
+}
+
+/// Fill colour state of the facts.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum Fill {
+    /// A device-family space: the extractor's own fill colour applies.
+    #[default]
+    Device,
+    /// A Separation / DeviceN / Indexed space (`space`), or an unknown one
+    /// (`space: None`: Pattern, unresolvable name, unsupported definition).
+    Space {
+        space: Option<Arc<TintSpace>>,
+        color: Option<Color>,
+    },
+}
+
+impl Fill {
+    fn color(&self, device: Option<Color>) -> Option<Color> {
+        match self {
+            Fill::Device => device,
+            Fill::Space { color, .. } => *color,
+        }
+    }
+}
+
+/// Process colour space a tint or index maps into.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Process {
+    Gray,
+    Rgb,
+    Cmyk,
+}
+
+impl Process {
+    fn n(self) -> usize {
+        match self {
+            Process::Gray => 1,
+            Process::Rgb => 3,
+            Process::Cmyk => 4,
+        }
+    }
+
+    fn to_color(self, v: &[f32]) -> Option<Color> {
+        let v = v.get(..self.n())?;
+        if !v.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let c = |x: f32| x.clamp(0.0, 1.0);
+        let (r, g, b) = match self {
+            Process::Gray => (c(v[0]), c(v[0]), c(v[0])),
+            Process::Rgb => (c(v[0]), c(v[1]), c(v[2])),
+            Process::Cmyk => crate::color::cmyk_to_rgb(v[0], v[1], v[2], v[3]),
+        };
+        Some(Color::new(r, g, b))
+    }
+}
+
+/// A tint transform (ISO 32000-1 §7.10) the facts can evaluate.
+#[derive(Debug)]
+pub(crate) enum TintFn {
+    /// Exponential interpolation, single input.
+    Type2 {
+        c0: Vec<f32>,
+        c1: Vec<f32>,
+        n: f32,
+        domain: [f32; 2],
+    },
+    /// PostScript calculator, compiled once.
+    Type4 {
+        program: crate::functions::Program,
+        domain: Vec<[f64; 2]>,
+        range: Vec<[f64; 2]>,
+    },
+}
+
+impl TintFn {
+    fn eval(&self, inputs: &[f32]) -> Option<Vec<f32>> {
+        match self {
+            TintFn::Type2 { c0, c1, n, domain } => {
+                let t = inputs.first()?.max(domain[0]).min(domain[1]);
+                let tn = t.powf(*n);
+                Some(c0.iter().zip(c1).map(|(a, b)| a + tn * (b - a)).collect())
+            },
+            TintFn::Type4 {
+                program,
+                domain,
+                range,
+            } => {
+                let inputs: Vec<f64> = inputs.iter().map(|&v| v as f64).collect();
+                let out = program.evaluate_clamped(&inputs, domain, range).ok()?;
+                Some(out.into_iter().map(|v| v as f32).collect())
+            },
+        }
+    }
+}
+
+/// A resolved Separation / DeviceN / Indexed colour space.
+#[derive(Debug)]
+pub(crate) enum TintSpace {
+    /// Separation `/All` or `/Black`: gray `1 - tint`.
+    Gray,
+    /// Separation `/None`, or DeviceN of `/None` colorants only.
+    NoInk,
+    /// DeviceN of process colorants: component -> CMYK slot (`None` ignored).
+    ProcessN(Vec<Option<usize>>),
+    /// Tint transform into an alternate space.
+    Function {
+        n_in: usize,
+        func: TintFn,
+        alt: Process,
+    },
+    /// `[/Indexed base hival lookup]`.
+    Indexed {
+        base: Process,
+        hival: usize,
+        lookup: Vec<u8>,
+    },
+}
+
+impl TintSpace {
+    fn eval(&self, comps: &[f32]) -> Option<Color> {
+        match self {
+            TintSpace::Gray => Process::Gray.to_color(&[1.0 - comps.first()?]),
+            TintSpace::NoInk => None,
+            TintSpace::ProcessN(slots) => {
+                if comps.len() != slots.len() {
+                    return None;
+                }
+                let mut cmyk = [0.0; 4];
+                for (v, slot) in comps.iter().zip(slots) {
+                    if let Some(s) = slot {
+                        cmyk[*s] = *v;
+                    }
+                }
+                Process::Cmyk.to_color(&cmyk)
+            },
+            TintSpace::Function { n_in, func, alt } => {
+                if comps.len() != *n_in {
+                    return None;
+                }
+                alt.to_color(&func.eval(comps)?)
+            },
+            TintSpace::Indexed {
+                base,
+                hival,
+                lookup,
+            } => {
+                let i = *comps.first()?;
+                if !i.is_finite() {
+                    return None;
+                }
+                let i = (i.round().max(0.0) as usize).min(*hival);
+                let n = base.n();
+                let bytes = lookup.get(i * n..(i + 1) * n)?;
+                let v: Vec<f32> = bytes.iter().map(|&b| b as f32 / 255.0).collect();
+                base.to_color(&v)
+            },
+        }
+    }
+
+    /// Colour right after `cs` (§8.6.8): tint 1.0 per component, index 0.
+    fn initial(&self) -> Option<Color> {
+        match self {
+            TintSpace::Indexed { .. } => self.eval(&[0.0]),
+            TintSpace::ProcessN(slots) => self.eval(&vec![1.0; slots.len()]),
+            TintSpace::Function { n_in, .. } => self.eval(&vec![1.0; *n_in]),
+            TintSpace::Gray | TintSpace::NoInk => self.eval(&[1.0]),
+        }
+    }
+}
+
+/// How a colour space is treated by the facts.
+#[derive(Debug, Clone)]
+enum SpaceFact {
+    Device,
+    Unknown,
+    Tint(Arc<TintSpace>),
+}
+
+type Doc<'a> = Option<&'a crate::document::PdfDocument>;
+
+fn deref<'a>(o: &'a Object, doc: Doc) -> Option<Cow<'a, Object>> {
+    match o.as_reference() {
+        Some(r) => doc?
+            .load_object(r)
+            .ok()
+            .filter(|o| o.as_reference().is_none())
+            .map(Cow::Owned),
+        None => Some(Cow::Borrowed(o)),
+    }
+}
+
+fn num(o: &Object) -> Option<f32> {
+    match o {
+        Object::Integer(i) => Some(*i as f32),
+        Object::Real(r) => Some(*r as f32),
+        _ => None,
+    }
+    .filter(|v| v.is_finite())
+}
+
+fn nums(o: Option<&Object>, doc: Doc) -> Option<Vec<f32>> {
+    let o = deref(o?, doc)?;
+    o.as_array()?.iter().map(num).collect()
+}
+
+fn stream_bytes(o: &Object, doc: Doc) -> Option<Vec<u8>> {
+    match o.as_reference() {
+        Some(r) => {
+            let d = doc?;
+            let s = d.load_object(r).ok()?;
+            matches!(s, Object::Stream { .. })
+                .then(|| d.decode_stream_with_encryption(&s, r).ok())
+                .flatten()
+        },
+        None => matches!(o, Object::Stream { .. })
+            .then(|| o.decode_stream_data().ok())
+            .flatten(),
+    }
+}
+
+/// A process space (Device*, Cal*, ICCBased by `/N`) used as an alternate
+/// or `Indexed` base.
+fn process(o: &Object, doc: Doc) -> Option<Process> {
+    let o = deref(o, doc)?;
+    let (family, arg) = match &*o {
+        Object::Name(n) => (n.as_str(), None),
+        Object::Array(a) => (a.first()?.as_name()?, a.get(1)),
+        _ => return None,
+    };
+    match family {
+        "DeviceGray" | "CalGray" => Some(Process::Gray),
+        "DeviceRGB" | "CalRGB" => Some(Process::Rgb),
+        "DeviceCMYK" => Some(Process::Cmyk),
+        "ICCBased" => {
+            let s = deref(arg?, doc)?;
+            match deref(s.as_dict()?.get("N")?, doc)?.as_integer()? {
+                1 => Some(Process::Gray),
+                3 => Some(Process::Rgb),
+                4 => Some(Process::Cmyk),
+                _ => None,
+            }
+        },
+        _ => None,
+    }
+}
+
+fn tint_fn(o: &Object, doc: Doc, n_in: usize) -> Option<TintFn> {
+    let f = deref(o, doc)?;
+    let d = f.as_dict()?;
+    let pairs = |k: &str| -> Vec<[f64; 2]> {
+        nums(d.get(k), doc)
+            .unwrap_or_default()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| [p[0] as f64, p[1] as f64])
+            .collect()
+    };
+    match deref(d.get("FunctionType")?, doc)?.as_integer()? {
+        2 if n_in == 1 => {
+            let c0 = nums(d.get("C0"), doc).unwrap_or_else(|| vec![0.0]);
+            let c1 = nums(d.get("C1"), doc).unwrap_or_else(|| vec![1.0]);
+            let n = num(&*deref(d.get("N")?, doc)?)?;
+            let domain = pairs("Domain")
+                .first()
+                .map(|p| [p[0].min(p[1]) as f32, p[0].max(p[1]) as f32])
+                .unwrap_or([0.0, 1.0]);
+            (c0.len() == c1.len()).then_some(TintFn::Type2 { c0, c1, n, domain })
+        },
+        4 => {
+            let program = crate::functions::Program::compile(&stream_bytes(o, doc)?).ok()?;
+            Some(TintFn::Type4 {
+                program,
+                domain: pairs("Domain"),
+                range: pairs("Range"),
+            })
+        },
+        _ => None,
+    }
+}
+
+fn tint_space(family: &str, a: &[Object], doc: Doc) -> Option<TintSpace> {
+    match family {
+        "Separation" => match deref(a.get(1)?, doc)?.as_name()? {
+            "All" | "Black" => Some(TintSpace::Gray),
+            "None" => Some(TintSpace::NoInk),
+            _ => Some(TintSpace::Function {
+                n_in: 1,
+                func: tint_fn(a.get(3)?, doc, 1)?,
+                alt: process(a.get(2)?, doc)?,
+            }),
+        },
+        "DeviceN" => {
+            let names = deref(a.get(1)?, doc)?;
+            let names: Vec<&str> = names
+                .as_array()?
+                .iter()
+                .map(|n| n.as_name())
+                .collect::<Option<_>>()?;
+            if names.is_empty() || names.len() > 32 {
+                return None;
+            }
+            let slots: Option<Vec<Option<usize>>> = names
+                .iter()
+                .map(|n| match *n {
+                    "Cyan" => Some(Some(0)),
+                    "Magenta" => Some(Some(1)),
+                    "Yellow" => Some(Some(2)),
+                    "Black" => Some(Some(3)),
+                    "None" => Some(None),
+                    _ => None,
+                })
+                .collect();
+            match slots {
+                Some(s) if s.iter().all(|x| x.is_none()) => Some(TintSpace::NoInk),
+                Some(s) => Some(TintSpace::ProcessN(s)),
+                None => Some(TintSpace::Function {
+                    n_in: names.len(),
+                    func: tint_fn(a.get(3)?, doc, names.len())?,
+                    alt: process(a.get(2)?, doc)?,
+                }),
+            }
+        },
+        "Indexed" => {
+            let base = process(a.get(1)?, doc)?;
+            let hival = deref(a.get(2)?, doc)?.as_integer()?;
+            if !(0..=255).contains(&hival) {
+                return None;
+            }
+            let lookup = match &*deref(a.get(3)?, doc)? {
+                Object::String(s) => s.clone(),
+                Object::Stream { .. } => stream_bytes(a.get(3)?, doc)?,
+                _ => return None,
+            };
+            Some(TintSpace::Indexed {
+                base,
+                hival: hival as usize,
+                lookup,
+            })
+        },
+        _ => None,
+    }
+}
+
+/// Classify a colour space given as a name or an array.
+fn classify(o: &Object, doc: Doc) -> SpaceFact {
+    let (family, arr) = match o {
+        Object::Name(n) => (n.as_str(), std::slice::from_ref(o)),
+        Object::Array(a) => match a.first().and_then(|f| f.as_name()) {
+            Some(f) => (f, a.as_slice()),
+            None => return SpaceFact::Unknown,
+        },
+        _ => return SpaceFact::Unknown,
+    };
+    match family {
+        "DeviceGray" | "DeviceRGB" | "DeviceCMYK" | "CalGray" | "CalRGB" | "Lab" | "ICCBased" => {
+            SpaceFact::Device
+        },
+        "Separation" | "DeviceN" | "Indexed" => tint_space(family, arr, doc)
+            .map(|t| SpaceFact::Tint(Arc::new(t)))
+            .unwrap_or(SpaceFact::Unknown),
+        _ => SpaceFact::Unknown,
+    }
 }
 
 impl Default for VisState {
@@ -130,6 +508,7 @@ impl Default for VisState {
             stroke_alpha: 1.0,
             soft_mask: false,
             blend_non_normal: false,
+            fill: Fill::Device,
         }
     }
 }
@@ -145,11 +524,13 @@ pub(crate) struct VisibilityTracker {
     pending_clip: bool,
     order: u32,
     pub(crate) paints: Vec<PaintEvent>,
+    /// `cs` operand -> resolved space, for the current `/Resources` only.
+    cs_names: HashMap<String, SpaceFact>,
 }
 
 impl VisibilityTracker {
     pub(crate) fn save(&mut self) {
-        self.stack.push(self.current);
+        self.stack.push(self.current.clone());
     }
 
     pub(crate) fn restore(&mut self) {
@@ -165,6 +546,73 @@ impl VisibilityTracker {
         if let Some(a) = stroke.filter(|a| a.is_finite()) {
             self.current.stroke_alpha = a.clamp(0.0, 1.0);
         }
+    }
+
+    /// The extractor's `/Resources` changed: drop the name cache.
+    pub(crate) fn resources_changed(&mut self) {
+        self.cs_names.clear();
+    }
+
+    /// Fill state after `cs name`; `lookup` resolves `/Resources/ColorSpace/name`.
+    pub(crate) fn fill_after_cs(
+        &mut self,
+        name: &str,
+        doc: Doc,
+        lookup: impl FnOnce(&str) -> Option<Object>,
+    ) -> Fill {
+        let fact = match self.cs_names.get(name) {
+            Some(f) => f.clone(),
+            None => {
+                let literal = classify(&Object::Name(name.to_string()), doc);
+                let f = match literal {
+                    SpaceFact::Unknown if name != "Pattern" => lookup(name)
+                        .map(|o| classify(&o, doc))
+                        .unwrap_or(SpaceFact::Unknown),
+                    f => f,
+                };
+                if self.cs_names.len() >= 256 {
+                    self.cs_names.clear();
+                }
+                self.cs_names.insert(name.to_string(), f.clone());
+                f
+            },
+        };
+        match fact {
+            SpaceFact::Device => Fill::Device,
+            SpaceFact::Unknown => Fill::Space {
+                space: None,
+                color: None,
+            },
+            SpaceFact::Tint(t) => Fill::Space {
+                color: t.initial(),
+                space: Some(t),
+            },
+        }
+    }
+
+    /// Fill state after `sc`/`scn` with `comps` in the current space.
+    pub(crate) fn fill_after_sc(&self, comps: &[f32]) -> Fill {
+        match &self.current.fill {
+            Fill::Device => Fill::Device,
+            Fill::Space { space, .. } => Fill::Space {
+                space: space.clone(),
+                color: space.as_ref().and_then(|s| s.eval(comps)),
+            },
+        }
+    }
+
+    /// Switching to `new` changes a non-device fill fact (spans drawn
+    /// before must be emitted first).
+    pub(crate) fn fill_changes(&self, new: &Fill) -> bool {
+        match (&self.current.fill, new) {
+            (Fill::Device, Fill::Device) => false,
+            (Fill::Space { color: a, .. }, Fill::Space { color: b, .. }) => a != b,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn set_fill(&mut self, fill: Fill) {
+        self.current.fill = fill;
     }
 
     pub(crate) fn set_soft_mask(&mut self, on: bool) {
@@ -250,6 +698,7 @@ impl VisibilityTracker {
                 } else {
                     PaintKind::Path
                 };
+                let color = self.current.fill.color(color);
                 self.push_paint(kind, painted, color, false);
             }
             if self.pending_clip {
@@ -320,8 +769,14 @@ impl VisibilityTracker {
         o
     }
 
-    /// Facts for a span just emitted with `bbox` under `render_mode`.
-    pub(crate) fn span_facts(&mut self, render_mode: u8, bbox: &Rect) -> SpanVisibility {
+    /// Facts for a span just emitted with `bbox` under `render_mode` and
+    /// device fill colour `color`.
+    pub(crate) fn span_facts(
+        &mut self,
+        render_mode: u8,
+        bbox: &Rect,
+        color: Color,
+    ) -> SpanVisibility {
         let clip_coverage = match self.current.clip {
             None => 1.0,
             Some(c) => coverage(bbox, c),
@@ -334,6 +789,7 @@ impl VisibilityTracker {
             blend_non_normal: self.current.blend_non_normal,
             clip_coverage,
             paint_order: self.next_order(),
+            fill_color: self.current.fill.color(Some(color)),
         }
     }
 }
@@ -476,7 +932,7 @@ mod tests {
         t.path_segment(true);
         t.mark_clip();
         t.end_path(false, false, None);
-        let v = t.span_facts(0, &Rect::new(0.0, 0.0, 50.0, 12.0));
+        let v = t.span_facts(0, &Rect::new(0.0, 0.0, 50.0, 12.0), Color::black());
         assert_eq!(v.clip_coverage, 0.0);
     }
 
@@ -485,10 +941,10 @@ mod tests {
         let mut t = VisibilityTracker::default();
         t.save();
         t.clip_to(&Matrix::identity(), 0.0, 0.0, 10.0, 10.0);
-        let inside = t.span_facts(0, &Rect::new(0.0, 0.0, 5.0, 5.0));
-        let half = t.span_facts(0, &Rect::new(5.0, 0.0, 10.0, 5.0));
+        let inside = t.span_facts(0, &Rect::new(0.0, 0.0, 5.0, 5.0), Color::black());
+        let half = t.span_facts(0, &Rect::new(5.0, 0.0, 10.0, 5.0), Color::black());
         t.restore();
-        let after = t.span_facts(0, &Rect::new(500.0, 500.0, 5.0, 5.0));
+        let after = t.span_facts(0, &Rect::new(500.0, 500.0, 5.0, 5.0), Color::black());
         assert_eq!(inside.clip_coverage, 1.0);
         assert!((half.clip_coverage - 0.5).abs() < 1e-6);
         assert_eq!(after.clip_coverage, 1.0);
