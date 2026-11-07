@@ -10284,6 +10284,7 @@ impl PdfDocument {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             });
         }
 
@@ -10458,6 +10459,7 @@ impl PdfDocument {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             });
         }
 
@@ -12877,6 +12879,29 @@ impl PdfDocument {
         let (ax, ay) = map(bbox.x, bbox.y);
         let (bx, by) = map(bbox.x + bbox.width, bbox.y + bbox.height);
         crate::geometry::Rect::new(ax.min(bx), ay.min(by), (ax - bx).abs(), (ay - by).abs())
+    }
+
+    /// Box runs whose text matrix turns them upright against the page
+    /// `/Rotate` (non-mirrored, content angle ≡ `rot` mod 360, `rot` ≠ 0) by
+    /// their physical hull ([`TextSpan::page_bbox`](crate::layout::TextSpan::page_bbox))
+    /// instead of the along-x extents, and mark them `turned_bbox`. Such a run
+    /// reads horizontally on the displayed page, so after the `/Rotate`
+    /// mapping of span postprocessing its box is again wide along the writing
+    /// axis. All other runs are left alone.
+    fn turn_upright_run_boxes(spans: &mut [crate::layout::TextSpan], rot: i32) {
+        let rot = rot.rem_euclid(360);
+        if !matches!(rot, 90 | 180 | 270) {
+            return;
+        }
+        for s in spans.iter_mut() {
+            if s.mirrored || s.turned_bbox || s.page_rotation_applied != 0 {
+                continue;
+            }
+            if (s.rotation_degrees.rem_euclid(360.0) - rot as f32).abs() < 0.5 {
+                s.bbox = s.page_bbox();
+                s.turned_bbox = true;
+            }
+        }
     }
 
     /// Map a single span's bbox into the displayed frame for a `/Rotate`d page
@@ -17463,7 +17488,11 @@ impl PdfDocument {
             }
         }
 
-        let spans = extractor.extract_text_spans(&content_data)?;
+        let mut spans = extractor.extract_text_spans(&content_data)?;
+        if spans.iter().any(|s| s.rotation_degrees != 0.0) {
+            let rot = self.get_page_rotation(page_index).unwrap_or(0);
+            Self::turn_upright_run_boxes(&mut spans, rot);
+        }
         if visibility_facts {
             let paints = extractor.take_paint_events();
             self.raw_paints
@@ -18091,7 +18120,12 @@ impl PdfDocument {
         }
 
         // Extract text spans
-        extractor.extract_text_spans(&content_data)
+        let mut spans = extractor.extract_text_spans(&content_data)?;
+        if spans.iter().any(|s| s.rotation_degrees != 0.0) {
+            let rot = self.get_page_rotation(page_index).unwrap_or(0);
+            Self::turn_upright_run_boxes(&mut spans, rot);
+        }
+        Ok(spans)
     }
 
     /// Extract individual characters from a PDF page.
@@ -20193,6 +20227,7 @@ impl PdfDocument {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             })
             .collect())
     }
@@ -28040,6 +28075,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 
@@ -28575,6 +28611,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 
@@ -32655,6 +32692,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             }
         }
 
@@ -32717,6 +32755,7 @@ mod tests {
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
                 artifact_type: None,
                 text: label.to_string(),
                 bbox: Rect::new(x, y, 80.0, 12.0),
@@ -32797,6 +32836,7 @@ mod tests {
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
                 artifact_type: None,
                 text: label.to_string(),
                 bbox: Rect::new(x, y, 80.0, 12.0),
@@ -32894,6 +32934,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 
@@ -33624,6 +33665,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             }
         }
 
@@ -33688,6 +33730,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             }
         }
 
@@ -33766,6 +33809,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             }
         }
 
@@ -33843,6 +33887,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             }
         }
 
@@ -34912,6 +34957,7 @@ mod soft_hyphen_seam_tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 

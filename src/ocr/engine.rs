@@ -86,6 +86,7 @@ impl OcrSpan {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 

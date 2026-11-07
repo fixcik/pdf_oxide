@@ -52,6 +52,7 @@ fn make_span(text: &str, x: f32, y: f32, font_size: f32, weight: FontWeight) -> 
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         },
         0,
     )
@@ -97,6 +98,7 @@ fn make_span_with_color(
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         },
         0,
     )
@@ -142,6 +144,7 @@ fn make_span_italic(
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         },
         0,
     )

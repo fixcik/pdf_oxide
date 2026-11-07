@@ -870,6 +870,7 @@ fn extract_cell(
                         rtl_draw_logical: false,
                         mirrored: false,
                         page_rotation_applied: 0,
+                        turned_bbox: false,
                     });
                     prev_block = Some(block);
                     break;
@@ -1238,6 +1239,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 
@@ -1437,6 +1439,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         let spans = vec![
             crate::layout::TextSpan {
@@ -1518,6 +1521,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         // Line 1: "Hello" ends at x=100, y=200.  Line 2: "World" starts at x=10, y=188.
         // y_diff = 12 > line_h * 0.5 = 6 → different lines → space inserted.
@@ -1598,6 +1602,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         // Line 1: bold "Bold" (y=200).  Line 2 (wrapped): italic "Italic" (y=188).
         let spans = vec![
@@ -1663,6 +1668,7 @@ mod tests {
             text_rise: 0.0,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
             artifact_type: None,
             text: "Rotated".into(),
             bbox: Rect::new(10.0, 200.0, 40.0, 12.0),
@@ -1761,6 +1767,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         // "数" ends at x=10+10=20; "≤" starts at x=23 → gap=3.0 > 1.5 → gap branch fires
         // CJK("数")→math_op("≤") with at least one CJK side → suppress space
@@ -1850,6 +1857,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         // "Hello" ends at 50; "world" starts at 53 → gap=3.0 > 1.5 → space inserted
         // Neither side is CJK, so the CJK suppression must NOT fire.

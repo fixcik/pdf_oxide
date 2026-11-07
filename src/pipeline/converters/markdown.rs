@@ -4308,6 +4308,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             0,
         )
@@ -4351,6 +4352,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             0,
         )
@@ -5107,6 +5109,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             order,
         );
@@ -5884,6 +5887,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         let mut cell = TableCell::new("Critical".to_string(), false);
         cell.spans.push(bold_span.clone());

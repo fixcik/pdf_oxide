@@ -373,6 +373,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -408,6 +409,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 

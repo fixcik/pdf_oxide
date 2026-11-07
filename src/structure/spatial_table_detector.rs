@@ -4963,6 +4963,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
     fn make_h_line(x: f32, y: f32, width: f32) -> crate::elements::PathContent {
@@ -7649,6 +7650,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 

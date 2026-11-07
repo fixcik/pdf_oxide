@@ -51,6 +51,7 @@ fn create_test_span(text: &str, x: f32, y: f32, width: f32, height: f32) -> Text
         rtl_draw_logical: false,
         mirrored: false,
         page_rotation_applied: 0,
+        turned_bbox: false,
     }
 }
 

@@ -166,6 +166,17 @@ pub struct TextSpan {
     /// serialized.
     #[serde(skip)]
     pub page_rotation_applied: i32,
+    /// `bbox` already is the run's physical hull, not its along-the-x-axis
+    /// extents: set for runs whose text matrix turns them upright against the
+    /// page `/Rotate` (content angle ≡ `/Rotate`, e.g. `0 -s s 0 Tm` under
+    /// `/Rotate 270`), which read as ordinary horizontal text on the displayed
+    /// page. In raw user space their `bbox` is then tall and narrow (where
+    /// the glyphs are drawn); once span postprocessing maps them into the
+    /// displayed frame it is wide and short again, with the writing axis
+    /// along x. [`Self::page_bbox`] returns `bbox` unchanged for them.
+    /// Runtime metadata — deliberately not serialized.
+    #[serde(skip)]
+    pub turned_bbox: bool,
     /// Provenance of this span's Unicode text — which ISO 32000-1 §9.10.2
     /// mapping tier the font offered, as a
     /// [`MappingProvenance`](crate::fonts::MappingProvenance). `None` when the
@@ -232,6 +243,7 @@ impl Default for TextSpan {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
             provenance: None,
             visibility: None,
         }
@@ -259,7 +271,7 @@ impl TextSpan {
     /// Mirrors [`crate::elements::PathContent::rendered_bbox`]: a derived accessor
     /// rather than a second stored rectangle that could drift out of sync.
     pub fn page_bbox(&self) -> Rect {
-        if self.rotation_degrees == 0.0 {
+        if self.rotation_degrees == 0.0 || self.turned_bbox {
             return self.bbox;
         }
         // Conjugate the run frame by the clockwise page rotation already

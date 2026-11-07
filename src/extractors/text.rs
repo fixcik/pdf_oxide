@@ -7976,6 +7976,7 @@ impl<'doc> TextExtractor<'doc> {
             rtl_draw_logical: false,
             mirrored: buffer.mirrored,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         self.span_sequence_counter += 1;
 
@@ -8511,6 +8512,7 @@ impl<'doc> TextExtractor<'doc> {
             rtl_draw_logical: false,
             mirrored: run_is_mirrored(&state.ctm.multiply(&state.text_matrix)),
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
 
         // Step 6: Increment sequence counter and add to spans
@@ -9316,6 +9318,7 @@ impl<'doc> TextExtractor<'doc> {
             rtl_draw_logical: false,
             mirrored: run_is_mirrored(&state.ctm.multiply(&state.text_matrix)),
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
         self.span_sequence_counter += 1;
 
@@ -9574,6 +9577,7 @@ impl<'doc> TextExtractor<'doc> {
                     rtl_draw_logical: false,
                     mirrored: buffer.mirrored,
                     page_rotation_applied: 0,
+                    turned_bbox: false,
                 };
                 self.span_sequence_counter += 1;
 
@@ -10820,6 +10824,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -10856,6 +10861,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -11747,6 +11753,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 
@@ -12763,6 +12770,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -12794,6 +12802,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -12850,6 +12859,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             };
 
         // (glyph, Helvetica per-em advance width)
@@ -12914,6 +12924,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         };
 
         // Stroke pass + fill pass at ~2 % of advance apart.
@@ -12974,6 +12985,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             });
         }
 
@@ -13176,6 +13188,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -13207,6 +13220,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -13237,6 +13251,7 @@ mod tests {
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
@@ -13268,6 +13283,7 @@ mod tests {
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(131.0, 700.0, 30.0, 12.0), // 1pt gap
@@ -13340,6 +13356,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -13371,6 +13388,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -13421,6 +13439,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -13452,6 +13471,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -13495,6 +13515,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -13526,6 +13547,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -13557,6 +13579,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -15994,6 +16017,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -16025,6 +16049,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -16066,6 +16091,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -16097,6 +16123,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -16198,6 +16225,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }];
 
         extractor.split_fused_words();
@@ -16240,6 +16268,7 @@ mod tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }];
 
         extractor.split_fused_words();
@@ -16429,6 +16458,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -16460,6 +16490,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -16547,6 +16578,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -16578,6 +16610,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -16885,6 +16918,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -16916,6 +16950,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -17129,6 +17164,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -17160,6 +17196,7 @@ mod tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -17708,6 +17745,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -17739,6 +17777,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -17789,6 +17828,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -17820,6 +17860,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -17870,6 +17911,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -17901,6 +17943,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -17957,6 +18000,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -17988,6 +18032,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -18036,6 +18081,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -18067,6 +18113,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -18112,6 +18159,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -18143,6 +18191,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -18192,6 +18241,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -18223,6 +18273,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -18267,6 +18318,7 @@ mod profile_based_space_tests {
             rtl_draw_logical: false,
             mirrored: false,
             page_rotation_applied: 0,
+            turned_bbox: false,
         }
     }
 
@@ -18402,6 +18454,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -18433,6 +18486,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
@@ -18491,6 +18545,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
             TextSpan {
                 provenance: None,
@@ -18522,6 +18577,7 @@ mod profile_based_space_tests {
                 rtl_draw_logical: false,
                 mirrored: false,
                 page_rotation_applied: 0,
+                turned_bbox: false,
             },
         ];
 
