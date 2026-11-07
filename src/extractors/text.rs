@@ -5594,7 +5594,10 @@ impl<'doc> TextExtractor<'doc> {
             Operator::ClosePath => return Ok(true),
             Operator::ClipNonZero | Operator::ClipEvenOdd => {
                 if let Some(v) = self.vis.as_mut() {
-                    v.mark_clip();
+                    v.mark_clip(
+                        matches!(op, Operator::ClipEvenOdd),
+                        crate::extractors::visibility::axis_aligned(&ctm),
+                    );
                 }
                 return Ok(true);
             },
