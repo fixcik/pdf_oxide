@@ -138,6 +138,62 @@ fn is_marginal_label(text: &str) -> bool {
     is_arabic || is_roman
 }
 
+/// Geometric check on top of [`is_marginal_label`]: returns, per span, whether
+/// a textually label-like span must NOT be treated as a margin label.
+///
+/// A numeral or roman token is inline text (not a margin label) when a
+/// non-label span lies on the same baseline (`|Δyc| < 0.5·min(h)`) closer than
+/// `2·fs` horizontally; a lowercase roman token is a label only when no other
+/// span at all is that close. `fs` is the span's font size (bbox height when
+/// the size is unknown). O(n log n): spans are sorted by vertical centre and
+/// each candidate scans only the band of centres within its own height.
+fn inline_label_mask(spans: &[TextSpan]) -> Vec<bool> {
+    let yc = |s: &TextSpan| s.bbox.y + s.bbox.height * 0.5;
+    let valid = |s: &TextSpan| {
+        !s.text.trim().is_empty()
+            && s.bbox.x.is_finite()
+            && s.bbox.y.is_finite()
+            && s.bbox.width.is_finite()
+            && s.bbox.height.is_finite()
+    };
+    let mut order: Vec<usize> = (0..spans.len()).filter(|&i| valid(&spans[i])).collect();
+    order.sort_by(|&a, &b| yc(&spans[a]).total_cmp(&yc(&spans[b])));
+    let centres: Vec<f32> = order.iter().map(|&i| yc(&spans[i])).collect();
+
+    let mut inline = vec![false; spans.len()];
+    for &i in &order {
+        let a = &spans[i];
+        // A zero/negative-height bbox has no baseline band: leave it a label.
+        if !(a.bbox.height > 0.0) || role_for_span(a) != RegionRole::MarginalLabel {
+            continue;
+        }
+        let t = a.text.trim();
+        let is_roman = !t.chars().all(|c| c.is_ascii_digit());
+        let fs = if a.font_size > 0.0 {
+            a.font_size
+        } else {
+            a.bbox.height
+        };
+        let reach = 2.0 * fs;
+        // |Δyc| < 0.5·min(h_a, h_b) <= 0.5·h_a, so this band holds every candidate.
+        let band = 0.5 * a.bbox.height;
+        let lo = centres.partition_point(|&c| c <= yc(a) - band);
+        let hi = centres.partition_point(|&c| c < yc(a) + band);
+        inline[i] = lo < hi
+            && order[lo..hi].iter().any(|&j| {
+                let b = &spans[j];
+                if j == i || (yc(a) - yc(b)).abs() >= 0.5 * a.bbox.height.min(b.bbox.height) {
+                    return false;
+                }
+                let gap = (b.bbox.x - (a.bbox.x + a.bbox.width))
+                    .max(a.bbox.x - (b.bbox.x + b.bbox.width))
+                    .max(0.0);
+                gap < reach && (is_roman || !is_marginal_label(&b.text))
+            });
+    }
+    inline
+}
+
 /// Union of two rectangles (corner-based).
 fn rect_union(a: &Rect, b: &Rect) -> Rect {
     let x0 = a.x.min(b.x);
@@ -384,8 +440,9 @@ pub(crate) fn build_structured_page_full(
         Some(if center < g { 0 } else { 1 })
     };
 
+    let inline_label = inline_label_mask(&spans);
     let mut regions: Vec<StructuredRegion> = Vec::new();
-    for span in spans {
+    for (idx, span) in spans.into_iter().enumerate() {
         if span.text.trim().is_empty() {
             continue;
         }
@@ -397,7 +454,10 @@ pub(crate) fn build_structured_page_full(
         let kind = if is_lbl {
             RegionRole::MarginalLabel
         } else {
-            role_for_span(&span)
+            match role_for_span(&span) {
+                RegionRole::MarginalLabel if inline_label[idx] => RegionRole::BodyBlock,
+                role => role,
+            }
         };
         let col = match kind {
             RegionRole::BodyBlock | RegionRole::MarginalLabel => column_of(&span),
@@ -558,6 +618,73 @@ mod tests {
         assert!(is_marginal_label("iv"));
         assert!(!is_marginal_label("Genesis"));
         assert!(!is_marginal_label("12345")); // too long
+    }
+
+    fn roles(spans: Vec<TextSpan>) -> Vec<(String, RegionRole)> {
+        // Single column so adjacent same-role spans coalesce predictably.
+        build_structured_page_with_mode(0, 612.0, 792.0, spans, ColumnMode::Single)
+            .regions
+            .into_iter()
+            .map(|r| (r.text, r.kind))
+            .collect()
+    }
+
+    fn sized(mut s: TextSpan) -> TextSpan {
+        s.font_size = 12.0;
+        s
+    }
+
+    #[test]
+    fn number_inline_in_prose_is_body() {
+        let r = roles(vec![
+            sized(span("in", 100.0, 700.0, 14.0)),
+            sized(span("2013", 118.0, 700.0, 28.0)),
+            sized(span("year", 150.0, 700.0, 26.0)),
+        ]);
+        assert!(r.iter().all(|(_, k)| *k == RegionRole::BodyBlock), "{r:?}");
+    }
+
+    #[test]
+    fn isolated_margin_numeral_stays_label() {
+        // Numeral far (> 2·fs) left of the text line, and a folio alone.
+        let r = roles(vec![
+            sized(span("14", 30.0, 700.0, 14.0)),
+            sized(span("firmament", 100.0, 700.0, 60.0)),
+            sized(span("300", 300.0, 40.0, 20.0)),
+        ]);
+        assert_eq!(r[0].1, RegionRole::MarginalLabel, "{r:?}");
+        assert_eq!(r.last().unwrap().1, RegionRole::MarginalLabel, "{r:?}");
+    }
+
+    #[test]
+    fn roman_letter_inside_line_is_not_label_but_isolated_is() {
+        let r = roles(vec![
+            sized(span("in/", 100.0, 700.0, 16.0)),
+            sized(span("i", 117.0, 700.0, 4.0)),
+            sized(span("-x", 122.0, 700.0, 12.0)),
+            sized(span("iv", 40.0, 500.0, 10.0)),
+        ]);
+        let i = r
+            .iter()
+            .find(|(t, _)| t.contains('i') && t.len() > 1 && t.contains("in/"))
+            .expect("line");
+        assert_eq!(i.1, RegionRole::BodyBlock, "{r:?}");
+        assert!(
+            r.iter().all(|(t, _)| t != "i"),
+            "inline `i` must not stay a separate label: {r:?}"
+        );
+        let iv = r.iter().find(|(t, _)| t == "iv").expect("iv");
+        assert_eq!(iv.1, RegionRole::MarginalLabel, "{r:?}");
+    }
+
+    #[test]
+    fn zero_height_numeral_does_not_panic() {
+        let mut z = sized(span("7", 100.0, 700.0, 6.0));
+        z.bbox.height = 0.0;
+        let mut n = sized(span("8", 100.0, 650.0, 6.0));
+        n.bbox.height = -1.0;
+        let r = roles(vec![z, n, sized(span("text", 120.0, 700.0, 30.0))]);
+        assert_eq!(r[0].1, RegionRole::MarginalLabel, "{r:?}");
     }
 
     #[test]
