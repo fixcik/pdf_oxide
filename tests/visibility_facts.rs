@@ -337,7 +337,9 @@ fn clip_kind_per_clip_shape() {
 
 #[test]
 fn clip_kind_nested_q_restores_and_form_bbox_is_rect() {
-    let content = b"q 0 0 612 792 re W n q 50 580 400 60 re 60 590 380 40 re W* n                     BT /F1 12 Tf 72 600 Td (RING) Tj ET Q                     BT /F1 12 Tf 72 560 Td (AFTER) Tj ET Q /X0 Do";
+    let content = b"q 0 0 612 792 re W n q 50 580 400 60 re 60 590 380 40 re W* n \
+                    BT /F1 12 Tf 72 600 Td (RING) Tj ET Q \
+                    BT /F1 12 Tf 72 560 Td (AFTER) Tj ET Q /X0 Do";
     let form = (
         "<< /Type /XObject /Subtype /Form /BBox [0 0 300 300] >>".to_string(),
         b"BT /F1 12 Tf 72 100 Td (INFORM) Tj ET".to_vec(),

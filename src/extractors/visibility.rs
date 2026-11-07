@@ -58,7 +58,7 @@ pub struct SpanVisibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, serde::Serialize)]
 #[non_exhaustive]
 pub enum ClipKind {
-    /// No clip in effect.
+    /// No path or `/BBox` clip in effect (text clips, `Tr` 4–7, are not tracked).
     #[default]
     None,
     /// Every clip in effect is a single axis-aligned rectangle (one `re` as the
@@ -66,9 +66,10 @@ pub enum ClipKind {
     /// axis-aligned CTM, or an empty `W n`), so the clip bbox is exact. A
     /// single-rectangle `W*` is also `Rect` (same region as `W`).
     Rect,
-    /// Some clip in effect is another nonzero-winding (`W`) path: several
-    /// subpaths (e.g. `re re W n`), `m`/`l`/`c` polygons or curves, or a
-    /// rectangle under a rotated/skewed CTM; the bbox over-approximates it.
+    /// No `EvenOdd` clip, but some clip in effect is not an exact axis-aligned
+    /// rectangle: several subpaths (e.g. `re re W n`), `m`/`l`/`c` polygons or
+    /// curves, or a rectangle under a rotated/skewed CTM (also with `W*`); the
+    /// bbox over-approximates it.
     Path,
     /// Some clip in effect was set with `W*` and is not a single rectangle
     /// (e.g. `outer re inner re W* n`, a ring); the bbox over-approximates it.
@@ -76,7 +77,7 @@ pub enum ClipKind {
 }
 
 /// Axis-aligned CTM: no rotation or skew other than 90-degree turns.
-fn axis_aligned(m: &crate::content::Matrix) -> bool {
+pub(crate) fn axis_aligned(m: &crate::content::Matrix) -> bool {
     (m.b == 0.0 && m.c == 0.0) || (m.a == 0.0 && m.d == 0.0)
 }
 
@@ -180,10 +181,9 @@ pub(crate) struct VisibilityTracker {
     path: Option<Bounds>,
     path_segments: u32,
     path_is_single_rect: bool,
-    path_subpaths: u32,
-    path_rect_axis: bool,
     pending_clip: bool,
     pending_clip_even_odd: bool,
+    pending_clip_axis: bool,
     order: u32,
     pub(crate) paints: Vec<PaintEvent>,
 }
@@ -276,26 +276,15 @@ impl VisibilityTracker {
     /// Count a path segment; `rect` marks an `re` operator.
     pub(crate) fn path_segment(&mut self, rect: bool) {
         self.path_segments += 1;
-        if rect {
-            self.path_subpaths += 1;
-        }
         self.path_is_single_rect = rect && self.path_segments == 1;
     }
 
-    /// Start a subpath with `m` (an `re` starts one in [`Self::path_segment`]).
-    pub(crate) fn path_move(&mut self) {
-        self.path_subpaths += 1;
-    }
-
-    /// Record whether the `re` just added is under an axis-aligned `ctm`.
-    pub(crate) fn path_rect_ctm(&mut self, ctm: &crate::content::Matrix) {
-        self.path_rect_axis = axis_aligned(ctm);
-    }
-
-    /// Mark the current path as a clip (`W`, or `W*` when `even_odd`).
-    pub(crate) fn mark_clip(&mut self, even_odd: bool) {
+    /// Mark the current path as a clip (`W`, or `W*` when `even_odd`);
+    /// `axis_aligned` = the CTM at the clip operator is axis-aligned.
+    pub(crate) fn mark_clip(&mut self, even_odd: bool, axis_aligned: bool) {
         self.pending_clip = true;
         self.pending_clip_even_odd = even_odd;
+        self.pending_clip_axis = axis_aligned;
     }
 
     /// End the current path. `fill` = the painting operator fills (records a
@@ -315,9 +304,8 @@ impl VisibilityTracker {
                 self.push_paint(kind, painted, color, false);
             }
             if self.pending_clip {
-                let single =
-                    self.path_is_single_rect && self.path_segments == 1 && self.path_subpaths == 1;
-                let kind = if single && self.path_rect_axis {
+                let single = self.path_is_single_rect;
+                let kind = if single && self.pending_clip_axis {
                     ClipKind::Rect
                 } else if self.pending_clip_even_odd && !single {
                     ClipKind::EvenOdd
@@ -339,10 +327,9 @@ impl VisibilityTracker {
         self.path = None;
         self.path_segments = 0;
         self.path_is_single_rect = false;
-        self.path_subpaths = 0;
-        self.path_rect_axis = false;
         self.pending_clip = false;
         self.pending_clip_even_odd = false;
+        self.pending_clip_axis = false;
     }
 
     /// Record an image (unit square under `ctm`).
@@ -552,7 +539,7 @@ mod tests {
         let mut t = VisibilityTracker::default();
         t.path_point(&Matrix::identity(), 10.0, 10.0);
         t.path_segment(true);
-        t.mark_clip(false);
+        t.mark_clip(false, true);
         t.end_path(false, false, None);
         let v = t.span_facts(0, &Rect::new(0.0, 0.0, 50.0, 12.0));
         assert_eq!(v.clip_coverage, 0.0);
@@ -589,9 +576,8 @@ mod tests {
         let m = Matrix::identity();
         t.path_point(&m, 0.0, 0.0);
         t.path_point(&m, 10.0, 10.0);
-        t.path_rect_ctm(&m);
         t.path_segment(true);
-        t.mark_clip(even_odd);
+        t.mark_clip(even_odd, true);
         t.end_path(false, false, None);
     }
 
@@ -608,9 +594,9 @@ mod tests {
         for _ in 0..2 {
             t.path_point(&m, 0.0, 0.0);
             t.path_point(&m, 5.0, 5.0);
-            t.path_move();
+            t.path_segment(false);
         }
-        t.mark_clip(true);
+        t.mark_clip(true, true);
         t.end_path(false, false, None);
         assert_eq!(t.span_facts(0, &bbox).clip_kind, ClipKind::EvenOdd);
         t.restore();
@@ -622,7 +608,7 @@ mod tests {
     #[test]
     fn clip_kind_empty_clip_is_rect_and_rotated_form_bbox_is_path() {
         let mut t = VisibilityTracker::default();
-        t.mark_clip(false);
+        t.mark_clip(false, true);
         t.end_path(false, false, None);
         assert_eq!(t.current.clip_kind, ClipKind::Rect);
         let rot = Matrix {
