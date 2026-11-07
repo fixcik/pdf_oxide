@@ -4513,6 +4513,98 @@ impl<'doc> TextExtractor<'doc> {
         None
     }
 
+    /// Per-line letter-spacing (tracking) estimates, indexed per span.
+    ///
+    /// HTML-to-PDF producers render CSS `letter-spacing` by drawing every
+    /// glyph with its own show operator and adding the same tracking amount
+    /// to every advance (ISO 32000-1:2008 §9.3.2 describes the same effect
+    /// for `Tc`). At ~0.14 em and above that uniform gap clears the fixed
+    /// geometric space threshold and the cross-font glue ceiling, so a
+    /// letter-spaced heading comes out as `C O N T A C T S`.
+    ///
+    /// The estimate is taken ONLY from adjacent single-glyph, alphabetic,
+    /// same-baseline spans — the per-glyph positioning that tracking is
+    /// drawn with. A line drawn one show per word never contributes (its
+    /// gaps are word gaps), so it never gets an estimate; nor does a line
+    /// drawn in multi-glyph pieces (justified or kerned text), whose few
+    /// single-letter pieces mostly sit at word boundaries. A run qualifies
+    /// when
+    ///   * at least 80 % of its non-blank spans are single letters (math and
+    ///     formula lines mix in operators, digits and multi-letter pieces),
+    ///   * it has at least three single-letter gaps whose median is a real
+    ///     tracking amount (0.05–0.5 em; untracked per-glyph lines sit near
+    ///     zero),
+    ///   * at least two thirds of them lie close to that median (tracking is
+    ///     uniform; word gaps without a space glyph are the outliers above
+    ///     it), and
+    ///   * at least three consecutive letters are set at or tighter than the
+    ///     median — a letter-spaced word. Single letters spaced evenly apart
+    ///     (formula variables, structure-diagram atom labels) do not chain.
+    ///
+    /// Lines that do not qualify get `None` and keep the default decisions.
+    fn tracked_line_gaps(spans: &[TextSpan]) -> Vec<Option<f32>> {
+        let single_letter = |s: &TextSpan| {
+            let mut chars = s.text.chars();
+            matches!((chars.next(), chars.next()), (Some(c), None) if c.is_alphabetic())
+        };
+        let n = spans.len();
+        let mut out = vec![None; n];
+        let mut i = 0;
+        while i < n {
+            let mut j = i;
+            while j + 1 < n && (spans[j].bbox.y - spans[j + 1].bbox.y).abs() < 1.0 {
+                j += 1;
+            }
+            let fs = spans[i..=j]
+                .iter()
+                .map(|s| s.font_size)
+                .fold(0.0f32, f32::max)
+                .max(1.0);
+            // Gap of each adjacent single-letter pair (None for other pairs).
+            let pair_gaps: Vec<Option<f32>> = (i..j)
+                .map(|k| {
+                    ((spans[k].bbox.y - spans[k + 1].bbox.y).abs() < fs * 0.04
+                        && single_letter(&spans[k])
+                        && single_letter(&spans[k + 1]))
+                    .then(|| spans[k + 1].bbox.x - (spans[k].bbox.x + spans[k].bbox.width))
+                })
+                .collect();
+            let mut gaps: Vec<f32> = pair_gaps.iter().flatten().copied().collect();
+            let inked = spans[i..=j].iter().filter(|s| !s.text.trim().is_empty());
+            let (inked, letters) = inked
+                .fold((0usize, 0usize), |(n, one), s| (n + 1, one + usize::from(single_letter(s))));
+            if gaps.len() >= 3 && letters * 5 >= inked * 4 {
+                gaps.sort_by(f32::total_cmp);
+                let median = gaps[gaps.len() / 2];
+                let tolerance = (fs * 0.02).max(median * 0.15);
+                let near = gaps
+                    .iter()
+                    .filter(|g| (**g - median).abs() <= tolerance)
+                    .count();
+                // Longest chain of consecutive letters set at (or tighter than)
+                // the tracking: a letter-spaced word.
+                let (mut chain, mut longest) = (0usize, 0usize);
+                for g in &pair_gaps {
+                    chain = match g {
+                        Some(g) if *g <= median + tolerance => chain + 1,
+                        _ => 0,
+                    };
+                    longest = longest.max(chain);
+                }
+                if (fs * 0.05..=fs * 0.5).contains(&median)
+                    && near * 3 >= gaps.len() * 2
+                    && longest >= 2
+                {
+                    for slot in out.iter_mut().take(j + 1).skip(i) {
+                        *slot = Some(median);
+                    }
+                }
+            }
+            i = j + 1;
+        }
+        out
+    }
+
     /// This matches the behavior of industry-standard PDF tools.
     fn merge_adjacent_spans(&mut self) {
         if self.spans.is_empty() {
@@ -4538,6 +4630,7 @@ impl<'doc> TextExtractor<'doc> {
         // used below to rescue a narrow word gap the fixed kerning guard
         // suppressed. Computed before the fold consumes the list.
         let line_thresholds = Self::bimodal_line_gap_thresholds(&spans);
+        let line_tracking = Self::tracked_line_gaps(&spans);
         let mut merged = Vec::with_capacity(old_len);
         let mut current_span: Option<TextSpan> = None;
 
@@ -4724,10 +4817,27 @@ impl<'doc> TextExtractor<'doc> {
             // advance-fold made per-glyph advance accurate enough that these
             // ~0.24em gaps — formerly inflated above 0.25em by the advance
             // undershoot — dropped under the ceiling and began gluing.)
+            //
+            // On a letter-spaced line every glyph gap carries the line's
+            // tracking (see `tracked_line_gaps`), so both this ceiling and the
+            // geometric space decision below are measured above the tracking:
+            // a gap up to `tracking + 0.12 em` is still within the word, while
+            // a word gap without a space glyph (tracking + a space advance of
+            // ~0.25 em) stays above it.
+            let tracked_word_ceiling = line_tracking
+                .get(span_idx)
+                .copied()
+                .flatten()
+                .filter(|_| {
+                    same_line
+                        && prev_tail_char.is_some_and(|c| !c.is_whitespace())
+                        && curr_head_char.is_some_and(|c| !c.is_whitespace())
+                })
+                .map(|tracking| tracking + font_size_ref * 0.12);
             let cross_font_word_glue = !is_same_font
                 && same_line
                 && gap > -1.0
-                && gap < font_size_ref * 0.12
+                && gap < tracked_word_ceiling.unwrap_or(font_size_ref * 0.12)
                 && !current.text.is_empty()
                 && !span.text.is_empty()
                 && !crosses_cjk_boundary
@@ -4953,6 +5063,24 @@ impl<'doc> TextExtractor<'doc> {
                                 space_decision =
                                     SpaceDecision::insert(SpaceSource::GeometricGap, 0.9);
                             }
+                        }
+                    }
+
+                    // Letter-spaced line: a purely geometric space whose gap is
+                    // within the line's tracking (+0.12 em) is the tracking
+                    // itself, not a word boundary. Applied after the rescue so
+                    // neither path can split a tracked word; explicit boundaries
+                    // (split boundary / TJ offset) are never vetoed.
+                    if let Some(ceiling) = tracked_word_ceiling {
+                        if space_decision.insert_space
+                            && !tj_offset_triggered_override
+                            && matches!(
+                                space_decision.source,
+                                SpaceSource::GeometricGap | SpaceSource::WordBoundaryAnalysis
+                            )
+                            && gap < ceiling
+                        {
+                            space_decision = SpaceDecision::no_space(SpaceSource::NoSpace, 0.9);
                         }
                     }
 
