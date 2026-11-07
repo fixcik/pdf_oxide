@@ -831,7 +831,7 @@ pub struct PageText {
 }
 
 /// A text block (word, line, or paragraph).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 #[cfg_attr(feature = "wasm", serde(rename_all = "camelCase"))]
 pub struct TextBlock {
     /// Characters in this block
@@ -866,12 +866,12 @@ pub struct TextBlock {
     /// Derived in `from_chars` from the constituent chars.
     #[serde(skip_serializing_if = "is_zero_f32", default)]
     pub rotation_degrees: f32,
-    /// Visibility facts of each glyph, aligned 1:1 with `chars` (each glyph
-    /// carries the facts of the span it came from). Filled by
-    /// [`PdfDocument::extract_words`](crate::document::PdfDocument::extract_words)
-    /// and its `_with_thresholds*` variants only while
-    /// [`PdfDocument::set_visibility_facts`](crate::document::PdfDocument::set_visibility_facts)
-    /// is on; empty otherwise (and then omitted from serialized output).
+    /// Per-glyph visibility facts, valid only when `char_visibility.len() == chars.len()`
+    /// (then `[i]` is char `i`; code editing `chars` must keep that or clear this). Each
+    /// entry is the fact set of the glyph's source span, so span counters such as
+    /// `tiny_glyphs` count that whole span, not the char. Set by `extract_words*`
+    /// while `PdfDocument::set_visibility_facts` is on; empty otherwise (and then
+    /// omitted from serialized output).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub char_visibility: Vec<crate::extractors::visibility::SpanVisibility>,
 }

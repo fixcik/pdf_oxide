@@ -1,5 +1,6 @@
 //! A run whose text matrix turns it upright against the page `/Rotate`
-//! (`0 1 -1 0 Tm` under `/Rotate 90`, `0 -1 1 0 Tm` under `/Rotate 270`) reads
+//! (`0 1 -1 0 Tm` under `/Rotate 90`, `-1 0 0 -1 Tm` under `/Rotate 180`,
+//! `0 -1 1 0 Tm` under `/Rotate 270`) reads
 //! as horizontal text on the displayed page. Its span box must cover the ink
 //! the renderer draws for it in raw user space (`extract_structured`), and
 //! its words in the displayed frame (`extract_words`), instead of a box laid
@@ -76,6 +77,7 @@ fn ink(doc: &PdfDocument) -> Rect {
 fn to_display(b: Rect, rotate: i32) -> Rect {
     let map = |x: f32, y: f32| match rotate {
         90 => (y, W - x),
+        180 => (W - x, H - y),
         270 => (H - y, x),
         _ => (x, y),
     };
@@ -124,6 +126,23 @@ fn check(rotate: i32, tm: &str) {
         .skip(1)
         .fold(words[0].bbox, |a, w| a.union(&w.bbox));
     assert_covers(union, ink, "extract_words (displayed frame)");
+    // `extract_page_text` chars of the turned raw span lie inside its box.
+    let page = doc.extract_page_text(0).unwrap();
+    let sb = page.spans[0].bbox;
+    for c in page.chars.iter().filter(|c| !c.char.is_whitespace()) {
+        let b = c.bbox;
+        let inside = b.x >= sb.x - 0.5
+            && b.y >= sb.y - 0.5
+            && b.x + b.width <= sb.x + sb.width + 0.5
+            && b.y + b.height <= sb.y + sb.height + 0.5;
+        assert!(inside, "char {:?} box {b:?} outside span box {sb:?}", c.char);
+    }
+    let all = page
+        .chars
+        .iter()
+        .skip(1)
+        .fold(page.chars[0].bbox, |a, c| a.union(&c.bbox));
+    assert_covers(to_display(all, rotate), ink, "extract_page_text chars (raw frame)");
 }
 
 #[test]
@@ -134,6 +153,11 @@ fn upright_run_on_a_rotate_90_page_covers_its_ink() {
 #[test]
 fn upright_run_on_a_rotate_270_page_covers_its_ink() {
     check(270, "0 -1 1 0 150 340");
+}
+
+#[test]
+fn upright_run_on_a_rotate_180_page_covers_its_ink() {
+    check(180, "-1 0 0 -1 250 200");
 }
 
 #[test]

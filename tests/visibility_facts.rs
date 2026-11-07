@@ -3,96 +3,12 @@
 //! off-page counter. Each PDF is a minimal synthetic one built in code.
 
 use pdf_oxide::document::PdfDocument;
-use pdf_oxide::extractors::{BlendMode, ClipKind, PaintKind, SpanVisibility, TINY_GLYPH_PT};
-use pdf_oxide::layout::TextSpan;
+use pdf_oxide::extractors::{ClipKind, PaintKind};
 use pdf_oxide::optional_content::compute_default_off_ocgs;
 use std::collections::HashSet;
 
-/// One-page PDF: 1 catalog (+`catalog_extra`), 2 pages, 3 page (Font F1 plus
-/// `resources_extra`), 4 content, 5 Helvetica, 6.. `extra` objects (each a
-/// full object body; a `stream` body is given as `(dict, data)`).
-fn pdf(
-    catalog_extra: &str,
-    resources_extra: &str,
-    content: &[u8],
-    extra: &[(String, Vec<u8>)],
-) -> Vec<u8> {
-    let mut objs: Vec<(String, Option<Vec<u8>>)> = vec![
-        (format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"), None),
-        ("<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), None),
-        (
-            format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
-                 /Resources << /Font << /F1 5 0 R >> {resources_extra} >> >>"
-            ),
-            None,
-        ),
-        ("<< >>".into(), Some(content.to_vec())),
-        (
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
-                .into(),
-            None,
-        ),
-    ];
-    for (dict, data) in extra {
-        objs.push((dict.clone(), (!data.is_empty()).then(|| data.clone())));
-    }
-    let mut out = b"%PDF-1.5\n".to_vec();
-    let mut offs = Vec::new();
-    for (i, (dict, data)) in objs.iter().enumerate() {
-        offs.push(out.len());
-        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
-        match data {
-            Some(d) => {
-                let dict = dict.trim_end_matches(">>").to_string();
-                out.extend_from_slice(
-                    format!("{dict} /Length {} >>\nstream\n", d.len()).as_bytes(),
-                );
-                out.extend_from_slice(d);
-                out.extend_from_slice(b"\nendstream");
-            },
-            None => out.extend_from_slice(dict.as_bytes()),
-        }
-        out.extend_from_slice(b"\nendobj\n");
-    }
-    let xref = out.len();
-    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
-    for o in offs {
-        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    out.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-            objs.len() + 1
-        )
-        .as_bytes(),
-    );
-    out
-}
-
-fn spans(doc: &PdfDocument) -> Vec<TextSpan> {
-    let page = doc.extract_structured(0).expect("extract_structured");
-    page.regions.into_iter().flat_map(|r| r.spans).collect()
-}
-
-fn facts_of(spans: &[TextSpan], needle: &str) -> SpanVisibility {
-    let s = spans
-        .iter()
-        .find(|s| s.text.contains(needle))
-        .unwrap_or_else(|| {
-            panic!(
-                "no span with {needle:?} in {:?}",
-                spans.iter().map(|s| &s.text).collect::<Vec<_>>()
-            )
-        });
-    s.visibility.expect("facts are on")
-}
-
-fn open_with_facts(bytes: Vec<u8>) -> PdfDocument {
-    let doc = PdfDocument::from_bytes(bytes).unwrap();
-    doc.set_visibility_facts(true);
-    doc
-}
+mod visibility_common;
+use visibility_common::{facts_of, open_with_facts, pdf, span_of, spans};
 
 #[test]
 fn facts_are_off_by_default() {
@@ -381,13 +297,6 @@ fn fill_and_clip_in_one_path_uses_the_previous_clip() {
     assert_eq!(pv.paints[0].clip_kind, ClipKind::None);
 }
 
-fn span_of<'a>(spans: &'a [TextSpan], needle: &str) -> &'a TextSpan {
-    spans
-        .iter()
-        .find(|s| s.text.contains(needle))
-        .unwrap_or_else(|| panic!("no span with {needle:?}"))
-}
-
 fn is_rgb(c: Option<pdf_oxide::layout::Color>, rgb: (f32, f32, f32)) -> bool {
     c.is_some_and(|c| {
         (c.r - rgb.0).abs() < 1e-3 && (c.g - rgb.1).abs() < 1e-3 && (c.b - rgb.2).abs() < 1e-3
@@ -515,111 +424,4 @@ fn stroke_colour_space_leaves_fill_alone_and_merged_runs_keep_the_first_colour()
     // of its first run (not the colour current at the end of the BT).
     assert!(is_rgb(facts_of(&s, "REDRUN").fill_color, (1.0, 0.0, 0.0)));
     assert!(is_rgb(facts_of(&s, "GRAYFIRST").fill_color, (0.5, 0.5, 0.5)));
-}
-
-#[test]
-fn letter_spaced_tiny_run_is_flagged_per_glyph() {
-    // 0.5 pt glyphs spread 6 pt apart by Tc: the span bbox is tiny in height
-    // but wide per character, so a span-level "height <= 1 and width/n <= 1"
-    // check misses it.
-    let content = b"BT /F1 12 Tf 72 700 Td (VISIBLE) Tj ET\n\
-                    BT /F1 0.5 Tf 6 Tc 72 650 Td (PWNED) Tj ET";
-    let s = spans(&open_with_facts(pdf("", "", content, &[])));
-    let tiny = span_of(&s, "PWNED");
-    let n = tiny.text.chars().count() as f32;
-    assert!(tiny.bbox.height <= TINY_GLYPH_PT);
-    assert!(tiny.bbox.width / n > TINY_GLYPH_PT, "span-level advance check passes it");
-    let v = tiny.visibility.unwrap();
-    assert_eq!(v.tiny_glyphs, 5);
-    assert!(v.glyph_advance_max.unwrap() <= TINY_GLYPH_PT);
-    assert!((v.glyph_size_min - 0.5).abs() < 1e-4);
-    let vis = facts_of(&s, "VISIBLE");
-    assert_eq!(vis.tiny_glyphs, 0);
-    assert!(vis.glyph_advance_max.unwrap() > TINY_GLYPH_PT);
-    assert!((vis.glyph_size_min - 12.0).abs() < 1e-4);
-}
-
-#[test]
-fn tiny_run_merged_into_a_normal_span_keeps_its_glyph_facts() {
-    // A tiny run right after a normal one on the same baseline is merged into
-    // one span whose bbox (and font_size) is that of the normal run.
-    let content = b"BT /F1 12 Tf 72 700 Td (Hello) Tj /F1 0.5 Tf (PWNED) Tj ET";
-    let s = spans(&open_with_facts(pdf("", "", content, &[])));
-    let merged = span_of(&s, "Hello");
-    assert!(merged.text.contains("PWNED"), "runs merged: {:?}", merged.text);
-    assert!(merged.bbox.height > TINY_GLYPH_PT);
-    let v = merged.visibility.unwrap();
-    assert_eq!(v.tiny_glyphs, 5);
-    assert!((v.glyph_size_min - 0.5).abs() < 1e-4);
-    assert!(v.glyph_advance_max.unwrap() > TINY_GLYPH_PT);
-}
-
-#[test]
-fn actual_text_run_has_no_glyph_advance() {
-    let content = b"BT /F1 0.5 Tf 72 700 Td /Span << /ActualText (REPL) >> BDC (x) Tj EMC ET";
-    let s = spans(&open_with_facts(pdf("", "", content, &[])));
-    let v = facts_of(&s, "REPL");
-    assert_eq!(v.glyph_advance_max, None);
-    assert_eq!(v.tiny_glyphs, 0);
-}
-
-/// A 2x2 ruled table; the bottom-right cell's word is drawn with `3 Tr`.
-fn table_pdf() -> Vec<u8> {
-    let content = b"0 G 1 w 72 600 200 60 re S 172 600 m 172 660 l S 72 630 m 272 630 l S\n\
-                    BT /F1 10 Tf 80 640 Td (Name) Tj ET\n\
-                    BT /F1 10 Tf 180 640 Td (Value) Tj ET\n\
-                    BT /F1 10 Tf 80 610 Td (Alpha) Tj ET\n\
-                    BT 3 Tr /F1 10 Tf 180 610 Td (SECRET) Tj ET";
-    pdf("", "", content, &[])
-}
-
-#[test]
-fn extract_words_carries_per_char_facts_when_on() {
-    let doc = open_with_facts(table_pdf());
-    let words = doc.extract_words(0).unwrap();
-    assert!(words.len() >= 4, "{:?}", words.iter().map(|w| &w.text).collect::<Vec<_>>());
-    for w in &words {
-        assert_eq!(w.char_visibility.len(), w.chars.len(), "word {:?}", w.text);
-    }
-    let word = |t: &str| words.iter().find(|w| w.text == t).expect(t);
-    assert!(word("SECRET")
-        .char_visibility
-        .iter()
-        .all(|v| v.render_mode == 3));
-    for t in ["Name", "Value", "Alpha"] {
-        assert!(word(t).char_visibility.iter().all(|v| v.render_mode == 0), "{t}");
-    }
-}
-
-#[test]
-fn extract_words_has_no_facts_when_off() {
-    let doc = PdfDocument::from_bytes(table_pdf()).unwrap();
-    let words = doc.extract_words(0).unwrap();
-    assert!(words.iter().any(|w| w.text == "SECRET"));
-    assert!(words.iter().all(|w| w.char_visibility.is_empty()));
-    let json = serde_json::to_string(&words).unwrap();
-    assert!(!json.contains("char_visibility"));
-}
-
-#[test]
-fn blend_mode_is_recorded_on_paints_and_spans() {
-    let content = b"0 0 1 rg 72 500 100 20 re f\n\
-                    q /GSM gs 1 1 0 rg 72 700 100 20 re f BT /F1 12 Tf 72 705 Td (UNDERMULTIPLY) Tj ET Q\n\
-                    q /GSA gs 72 400 100 20 re f Q\n\
-                    q /GSN gs BT /F1 12 Tf 72 300 Td (NORMALGS) Tj ET Q\n\
-                    BT /F1 12 Tf 72 200 Td (AFTERQ) Tj ET";
-    let res = "/ExtGState << /GSM << /BM /Multiply >> /GSA << /BM [/Screen /Normal] >> \
-               /GSN << /BM /Compatible >> >>";
-    let doc = open_with_facts(pdf("", res, content, &[]));
-    let s = spans(&doc);
-    let paints = doc.page_visibility(0).expect("page facts").paints;
-    let modes: Vec<BlendMode> = paints.iter().map(|p| p.blend_mode).collect();
-    assert_eq!(modes, [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen]);
-    let m = facts_of(&s, "UNDERMULTIPLY");
-    assert_eq!(m.blend_mode, BlendMode::Multiply);
-    assert!(m.blend_non_normal);
-    for t in ["NORMALGS", "AFTERQ"] {
-        assert_eq!(facts_of(&s, t).blend_mode, BlendMode::Normal, "{t}");
-        assert!(!facts_of(&s, t).blend_non_normal);
-    }
 }

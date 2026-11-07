@@ -387,6 +387,8 @@ struct RunningArtifactSignature {
     occurrences: Vec<(usize, crate::geometry::Rect)>,
 }
 
+mod turned_runs;
+
 /// PDF document.
 ///
 /// This structure represents an open PDF document, providing access to:
@@ -12881,48 +12883,6 @@ impl PdfDocument {
         crate::geometry::Rect::new(ax.min(bx), ay.min(by), (ax - bx).abs(), (ay - by).abs())
     }
 
-    /// Box runs whose text matrix turns them upright against the page
-    /// `/Rotate` (non-mirrored, content angle ≡ `rot` mod 360, `rot` ≠ 0) by
-    /// their physical hull ([`TextSpan::page_bbox`](crate::layout::TextSpan::page_bbox))
-    /// instead of the along-x extents, and mark them `turned_bbox` (raw user
-    /// space; such a run reads horizontally on the displayed page). All other
-    /// runs are left alone.
-    fn turn_upright_run_boxes(spans: &mut [crate::layout::TextSpan], rot: i32) {
-        let rot = rot.rem_euclid(360);
-        if !matches!(rot, 90 | 180 | 270) {
-            return;
-        }
-        for s in spans.iter_mut() {
-            if s.mirrored || s.turned_bbox || s.page_rotation_applied != 0 {
-                continue;
-            }
-            if (s.rotation_degrees.rem_euclid(360.0) - rot as f32).abs() < 0.5 {
-                s.bbox = s.page_bbox();
-                s.turned_bbox = true;
-            }
-        }
-    }
-
-    /// A displayed-frame span (already mapped through the page `/Rotate`) of
-    /// a run turned upright against that rotation, re-boxed by its physical
-    /// hull so its glyphs lay out along x like any horizontal run (words and
-    /// text lines); `None` for every other span.
-    fn upright_in_displayed_frame(s: &crate::layout::TextSpan) -> Option<crate::layout::TextSpan> {
-        let rot = s.page_rotation_applied.rem_euclid(360);
-        if s.mirrored
-            || s.turned_bbox
-            || !matches!(rot, 90 | 180 | 270)
-            || (s.rotation_degrees.rem_euclid(360.0) - rot as f32).abs() >= 0.5
-        {
-            return None;
-        }
-        let mut t = s.clone();
-        t.bbox = s.page_bbox();
-        t.char_x_offsets.clear();
-        t.turned_bbox = true;
-        Some(t)
-    }
-
     /// Map a single span's bbox into the displayed frame for a `/Rotate`d page
     /// (translate to origin → [`rotate_span_bbox`] → translate back).
     fn map_span_into_rotated_frame(
@@ -18044,7 +18004,10 @@ impl PdfDocument {
         let spans = self.extract_spans_with_reading_order(page_index, reading_order)?;
 
         // Derive chars from spans (uses char_widths for accurate positioning)
-        let chars: Vec<crate::layout::TextChar> = spans.iter().flat_map(|s| s.to_chars()).collect();
+        let chars: Vec<crate::layout::TextChar> = spans
+            .iter()
+            .flat_map(Self::chars_of_reading_order_span)
+            .collect();
 
         // Get page dimensions from MediaBox
         let media_box = self.get_page_media_box(page_index)?;
