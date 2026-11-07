@@ -513,6 +513,7 @@ pub fn extract_table_from_spans_on_page(
                 mcid: s.mcid,
                 sequence: s.sequence,
                 rotation_degrees: s.rotation_degrees,
+                char_visibility: Vec::new(),
             }
         })
         .collect();

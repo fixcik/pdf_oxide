@@ -276,6 +276,7 @@ mod tests {
             mcid: None,
             sequence: 0,
             rotation_degrees: 0.0,
+            char_visibility: Vec::new(),
         }
     }
 

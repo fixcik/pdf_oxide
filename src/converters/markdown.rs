@@ -290,6 +290,7 @@ impl MarkdownConverter {
                     mcid: span.mcid,
                     sequence: span.sequence,
                     rotation_degrees: span.rotation_degrees,
+                    char_visibility: Vec::new(),
                 })
             })
             .collect();
@@ -2064,6 +2065,7 @@ mod tests {
                 mcid: None,
                 sequence: 0,
                 rotation_degrees: 0.0,
+                char_visibility: Vec::new(),
             },
             TextBlock {
                 chars: vec![],
@@ -2076,6 +2078,7 @@ mod tests {
                 mcid: None,
                 sequence: 0,
                 rotation_degrees: 0.0,
+                char_visibility: Vec::new(),
             },
             TextBlock {
                 chars: vec![],
@@ -2088,6 +2091,7 @@ mod tests {
                 mcid: None,
                 sequence: 0,
                 rotation_degrees: 0.0,
+                char_visibility: Vec::new(),
             },
         ];
 

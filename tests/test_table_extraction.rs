@@ -21,6 +21,7 @@ fn mock_text_block(text: &str, mcid: u32) -> TextBlock {
         mcid: Some(mcid),
         sequence: 0,
         rotation_degrees: 0.0,
+        char_visibility: Vec::new(),
     }
 }
 

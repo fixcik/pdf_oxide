@@ -146,6 +146,7 @@ impl HtmlConverter {
                 mcid: span.mcid,
                 sequence: span.sequence,
                 rotation_degrees: span.rotation_degrees,
+                char_visibility: Vec::new(),
             })
             .collect();
 

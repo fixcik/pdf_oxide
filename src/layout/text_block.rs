@@ -851,6 +851,14 @@ pub struct TextBlock {
     /// Derived in `from_chars` from the constituent chars.
     #[serde(skip_serializing_if = "is_zero_f32", default)]
     pub rotation_degrees: f32,
+    /// Visibility facts of each glyph, aligned 1:1 with `chars` (each glyph
+    /// carries the facts of the span it came from). Filled by
+    /// [`PdfDocument::extract_words`](crate::document::PdfDocument::extract_words)
+    /// and its `_with_thresholds*` variants only while
+    /// [`PdfDocument::set_visibility_facts`](crate::document::PdfDocument::set_visibility_facts)
+    /// is on; empty otherwise (and then omitted from serialized output).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub char_visibility: Vec<crate::extractors::visibility::SpanVisibility>,
 }
 
 impl TextBlock {
@@ -923,6 +931,7 @@ impl TextBlock {
             mcid,
             sequence: 0,
             rotation_degrees,
+            char_visibility: Vec::new(),
         }
     }
 
@@ -961,6 +970,14 @@ impl TextBlock {
             self.mcid = None;
         }
         self.text.push_str(&other.text);
+        // Keep `char_visibility` empty or aligned with `chars`.
+        if self.char_visibility.len() == self.chars.len()
+            && other.char_visibility.len() == other.chars.len()
+        {
+            self.char_visibility.extend(other.char_visibility);
+        } else {
+            self.char_visibility.clear();
+        }
         self.chars.extend(other.chars);
     }
 

@@ -18785,6 +18785,9 @@ impl PdfDocument {
                             let mut word =
                                 Word::from_chars(std::mem::take(&mut current_word_chars));
                             word.sequence = span.sequence;
+                            if let Some(v) = span.visibility {
+                                word.char_visibility = vec![v; word.chars.len()];
+                            }
                             words.push(word);
                             continues_prev.push(false);
                             word_src_ranges.push((src_lo, src_hi));
@@ -18800,6 +18803,9 @@ impl PdfDocument {
                 if !current_word_chars.is_empty() {
                     let mut word = Word::from_chars(current_word_chars);
                     word.sequence = span.sequence;
+                    if let Some(v) = span.visibility {
+                        word.char_visibility = vec![v; word.chars.len()];
+                    }
                     words.push(word);
                     continues_prev.push(false);
                     word_src_ranges.push((src_lo, src_hi));

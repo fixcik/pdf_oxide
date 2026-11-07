@@ -563,6 +563,44 @@ fn actual_text_run_has_no_glyph_advance() {
     assert_eq!(v.tiny_glyphs, 0);
 }
 
+/// A 2x2 ruled table; the bottom-right cell's word is drawn with `3 Tr`.
+fn table_pdf() -> Vec<u8> {
+    let content = b"0 G 1 w 72 600 200 60 re S 172 600 m 172 660 l S 72 630 m 272 630 l S\n\
+                    BT /F1 10 Tf 80 640 Td (Name) Tj ET\n\
+                    BT /F1 10 Tf 180 640 Td (Value) Tj ET\n\
+                    BT /F1 10 Tf 80 610 Td (Alpha) Tj ET\n\
+                    BT 3 Tr /F1 10 Tf 180 610 Td (SECRET) Tj ET";
+    pdf("", "", content, &[])
+}
+
+#[test]
+fn extract_words_carries_per_char_facts_when_on() {
+    let doc = open_with_facts(table_pdf());
+    let words = doc.extract_words(0).unwrap();
+    assert!(words.len() >= 4, "{:?}", words.iter().map(|w| &w.text).collect::<Vec<_>>());
+    for w in &words {
+        assert_eq!(w.char_visibility.len(), w.chars.len(), "word {:?}", w.text);
+    }
+    let word = |t: &str| words.iter().find(|w| w.text == t).expect(t);
+    assert!(word("SECRET")
+        .char_visibility
+        .iter()
+        .all(|v| v.render_mode == 3));
+    for t in ["Name", "Value", "Alpha"] {
+        assert!(word(t).char_visibility.iter().all(|v| v.render_mode == 0), "{t}");
+    }
+}
+
+#[test]
+fn extract_words_has_no_facts_when_off() {
+    let doc = PdfDocument::from_bytes(table_pdf()).unwrap();
+    let words = doc.extract_words(0).unwrap();
+    assert!(words.iter().any(|w| w.text == "SECRET"));
+    assert!(words.iter().all(|w| w.char_visibility.is_empty()));
+    let json = serde_json::to_string(&words).unwrap();
+    assert!(!json.contains("char_visibility"));
+}
+
 #[test]
 fn blend_mode_is_recorded_on_paints_and_spans() {
     let content = b"0 0 1 rg 72 500 100 20 re f\n\
