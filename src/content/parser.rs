@@ -115,6 +115,9 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
 /// keeps parsing instead of truncating, dropping only path construction,
 /// painting and clipping operators, so text drawn after a huge vector figure
 /// is not lost. The operators kept are still bounded, at twice the cap.
+///
+/// Past the cap, visibility facts are approximate: dropped clips and fills
+/// are not seen, so later text reads as unclipped and unoccluded.
 pub(crate) fn parse_content_stream_for_text(data: &[u8]) -> Result<Vec<Operator>> {
     parse_content_stream_capped(data, true)
 }
