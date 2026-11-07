@@ -3,7 +3,7 @@
 //! off-page counter. Each PDF is a minimal synthetic one built in code.
 
 use pdf_oxide::document::PdfDocument;
-use pdf_oxide::extractors::{PaintKind, SpanVisibility};
+use pdf_oxide::extractors::{ClipKind, PaintKind, SpanVisibility};
 use pdf_oxide::layout::TextSpan;
 use pdf_oxide::optional_content::compute_default_off_ocgs;
 use std::collections::HashSet;
@@ -311,4 +311,70 @@ fn text_after_the_operator_cap_survives_with_facts_on() {
     let with = text(&doc);
     assert!(with.contains("BeforeTheMap") && with.contains("AfterTheMap"), "{with}");
     assert!(facts_of(&spans(&doc), "AfterTheMap").clip_coverage > 0.99);
+}
+
+fn clip_kind_of(content: &[u8]) -> ClipKind {
+    let doc = open_with_facts(pdf("", "", content, &[]));
+    facts_of(&spans(&doc), "PROBE").clip_kind
+}
+
+#[test]
+fn clip_kind_per_clip_shape() {
+    let probe = " BT /F1 12 Tf 72 600 Td (PROBE) Tj ET";
+    let k = |clip: &str| clip_kind_of(format!("q {clip}{probe} Q").as_bytes());
+    assert_eq!(clip_kind_of(probe.as_bytes()), ClipKind::None);
+    assert_eq!(k("50 580 400 60 re W n"), ClipKind::Rect);
+    assert_eq!(k("50 580 400 60 re W* n"), ClipKind::Rect);
+    assert_eq!(k("W n"), ClipKind::Rect);
+    assert_eq!(k("50 580 400 60 re 60 590 10 10 re W n"), ClipKind::Path);
+    assert_eq!(k("50 580 m 450 580 l 450 640 l h W n"), ClipKind::Path);
+    assert_eq!(k("0.9 0.1 -0.1 0.9 0 0 cm 50 580 400 60 re W n"), ClipKind::Path);
+    assert_eq!(k("50 580 400 60 re 60 590 380 40 re W* n"), ClipKind::EvenOdd);
+    assert_eq!(k("0.9 0.1 -0.1 0.9 0 0 cm 50 580 400 60 re W* n"), ClipKind::Path);
+    // 90-degree turn stays axis-aligned.
+    assert_eq!(k("0 1 -1 0 612 0 cm 50 580 400 60 re W n"), ClipKind::Rect);
+}
+
+#[test]
+fn clip_kind_nested_q_restores_and_form_bbox_is_rect() {
+    let content = b"q 0 0 612 792 re W n q 50 580 400 60 re 60 590 380 40 re W* n                     BT /F1 12 Tf 72 600 Td (RING) Tj ET Q                     BT /F1 12 Tf 72 560 Td (AFTER) Tj ET Q /X0 Do";
+    let form = (
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 300 300] >>".to_string(),
+        b"BT /F1 12 Tf 72 100 Td (INFORM) Tj ET".to_vec(),
+    );
+    let doc = open_with_facts(pdf("", "/XObject << /X0 6 0 R >>", content, &[form]));
+    let s = spans(&doc);
+    assert_eq!(facts_of(&s, "RING").clip_kind, ClipKind::EvenOdd);
+    assert_eq!(facts_of(&s, "AFTER").clip_kind, ClipKind::Rect);
+    assert_eq!(facts_of(&s, "INFORM").clip_kind, ClipKind::Rect);
+}
+
+#[test]
+fn ring_clip_fill_is_tagged_and_keeps_bbox_semantics() {
+    let content = b"q 50 580 400 60 re 60 590 380 40 re W* n \
+                    1 g 0 0 612 792 re f \
+                    BT /F1 12 Tf 72 600 Td (RINGTEXT) Tj ET Q \
+                    1 g 10 10 20 20 re f";
+    let doc = open_with_facts(pdf("", "", content, &[]));
+    let s = spans(&doc);
+    let pv = doc.page_visibility(0).expect("page facts");
+    let ring = &pv.paints[0];
+    assert_eq!(ring.kind, PaintKind::Rect);
+    assert_eq!(ring.clip_kind, ClipKind::EvenOdd);
+    // bbox is still the outer rectangle (unchanged semantics).
+    assert!((ring.bbox.x - 50.0).abs() < 0.01 && (ring.bbox.width - 400.0).abs() < 0.01);
+    let t = facts_of(&s, "RINGTEXT");
+    assert_eq!(t.clip_kind, ClipKind::EvenOdd);
+    assert_eq!(t.clip_coverage, 1.0);
+    assert_eq!(pv.paints[1].clip_kind, ClipKind::None);
+}
+
+#[test]
+fn fill_and_clip_in_one_path_uses_the_previous_clip() {
+    let content = b"1 g 10 10 20 20 re W f BT /F1 12 Tf 72 700 Td (X) Tj ET";
+    let doc = open_with_facts(pdf("", "", content, &[]));
+    let s = spans(&doc);
+    assert_eq!(facts_of(&s, "X").clip_kind, ClipKind::Rect);
+    let pv = doc.page_visibility(0).expect("page facts");
+    assert_eq!(pv.paints[0].clip_kind, ClipKind::None);
 }

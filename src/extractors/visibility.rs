@@ -14,7 +14,8 @@
 //!
 //! Known limits: a text clip (`Tr` 4–7) does not narrow the clip for later
 //! content; clip paths are tracked as the bbox of their points (curves by their
-//! control-point hull); a Form XObject without text is reported as one opaque
+//! control-point hull), with [`ClipKind`] telling whether that bbox is exact;
+//! a Form XObject without text is reported as one opaque
 //! [`PaintKind::Form`] event instead of being walked; strokes are not
 //! recorded; a fill in a named `/Pattern` colour space reports the last
 //! device colour instead of `None`.
@@ -45,6 +46,38 @@ pub struct SpanVisibility {
     /// [`PaintEvent::paint_order`]: a paint with a larger value was drawn on
     /// top of this span.
     pub paint_order: u32,
+    /// Kind of clip in effect when the span was emitted.
+    pub clip_kind: ClipKind,
+}
+
+/// Shape class of the clip in effect (the clip bbox is always tracked; this
+/// says how well the bbox describes the clip region).
+///
+/// The effective kind is the maximum (`EvenOdd` > `Path` > `Rect` > `None`)
+/// over all clips intersected so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, serde::Serialize)]
+#[non_exhaustive]
+pub enum ClipKind {
+    /// No clip in effect.
+    #[default]
+    None,
+    /// Every clip in effect is a single axis-aligned rectangle (one `re` as the
+    /// whole clip path under an axis-aligned CTM, a Form `/BBox` under an
+    /// axis-aligned CTM, or an empty `W n`), so the clip bbox is exact. A
+    /// single-rectangle `W*` is also `Rect` (same region as `W`).
+    Rect,
+    /// Some clip in effect is another nonzero-winding (`W`) path: several
+    /// subpaths (e.g. `re re W n`), `m`/`l`/`c` polygons or curves, or a
+    /// rectangle under a rotated/skewed CTM; the bbox over-approximates it.
+    Path,
+    /// Some clip in effect was set with `W*` and is not a single rectangle
+    /// (e.g. `outer re inner re W* n`, a ring); the bbox over-approximates it.
+    EvenOdd,
+}
+
+/// Axis-aligned CTM: no rotation or skew other than 90-degree turns.
+fn axis_aligned(m: &crate::content::Matrix) -> bool {
+    (m.b == 0.0 && m.c == 0.0) || (m.a == 0.0 && m.d == 0.0)
 }
 
 /// What a [`PaintEvent`] painted.
@@ -82,6 +115,9 @@ pub struct PaintEvent {
     pub masked: bool,
     /// Position in the page's paint order (see [`SpanVisibility::paint_order`]).
     pub paint_order: u32,
+    /// Kind of clip in effect when the paint was recorded (for `re W f` the
+    /// clip before the new one).
+    pub clip_kind: ClipKind,
 }
 
 /// Page-level visibility facts.
@@ -116,6 +152,7 @@ fn intersect(a: Bounds, b: Bounds) -> Bounds {
 #[derive(Debug, Clone, Copy)]
 struct VisState {
     clip: Option<Bounds>,
+    clip_kind: ClipKind,
     fill_alpha: f32,
     stroke_alpha: f32,
     soft_mask: bool,
@@ -126,6 +163,7 @@ impl Default for VisState {
     fn default() -> Self {
         Self {
             clip: None,
+            clip_kind: ClipKind::None,
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             soft_mask: false,
@@ -142,7 +180,10 @@ pub(crate) struct VisibilityTracker {
     path: Option<Bounds>,
     path_segments: u32,
     path_is_single_rect: bool,
+    path_subpaths: u32,
+    path_rect_axis: bool,
     pending_clip: bool,
+    pending_clip_even_odd: bool,
     order: u32,
     pub(crate) paints: Vec<PaintEvent>,
 }
@@ -185,6 +226,12 @@ impl VisibilityTracker {
         y1: f32,
     ) {
         let b = Self::map_box(ctm, x0, y0, x1, y1);
+        let kind = if axis_aligned(ctm) {
+            ClipKind::Rect
+        } else {
+            ClipKind::Path
+        };
+        self.current.clip_kind = self.current.clip_kind.max(kind);
         self.current.clip = Some(match self.current.clip {
             Some(c) => intersect(c, b),
             None => b,
@@ -229,11 +276,26 @@ impl VisibilityTracker {
     /// Count a path segment; `rect` marks an `re` operator.
     pub(crate) fn path_segment(&mut self, rect: bool) {
         self.path_segments += 1;
+        if rect {
+            self.path_subpaths += 1;
+        }
         self.path_is_single_rect = rect && self.path_segments == 1;
     }
 
-    pub(crate) fn mark_clip(&mut self) {
+    /// Start a subpath with `m` (an `re` starts one in [`Self::path_segment`]).
+    pub(crate) fn path_move(&mut self) {
+        self.path_subpaths += 1;
+    }
+
+    /// Record whether the `re` just added is under an axis-aligned `ctm`.
+    pub(crate) fn path_rect_ctm(&mut self, ctm: &crate::content::Matrix) {
+        self.path_rect_axis = axis_aligned(ctm);
+    }
+
+    /// Mark the current path as a clip (`W`, or `W*` when `even_odd`).
+    pub(crate) fn mark_clip(&mut self, even_odd: bool) {
         self.pending_clip = true;
+        self.pending_clip_even_odd = even_odd;
     }
 
     /// End the current path. `fill` = the painting operator fills (records a
@@ -253,12 +315,23 @@ impl VisibilityTracker {
                 self.push_paint(kind, painted, color, false);
             }
             if self.pending_clip {
+                let single =
+                    self.path_is_single_rect && self.path_segments == 1 && self.path_subpaths == 1;
+                let kind = if single && self.path_rect_axis {
+                    ClipKind::Rect
+                } else if self.pending_clip_even_odd && !single {
+                    ClipKind::EvenOdd
+                } else {
+                    ClipKind::Path
+                };
+                self.current.clip_kind = self.current.clip_kind.max(kind);
                 self.current.clip = Some(match self.current.clip {
                     Some(c) => intersect(c, b),
                     None => b,
                 });
             }
         } else if self.pending_clip {
+            self.current.clip_kind = self.current.clip_kind.max(ClipKind::Rect);
             // `W n` with no path: an empty clip (nothing is visible after it).
             let c = self.current.clip.unwrap_or([0.0; 4]);
             self.current.clip = Some([c[0], c[1], c[0], c[1]]);
@@ -266,7 +339,10 @@ impl VisibilityTracker {
         self.path = None;
         self.path_segments = 0;
         self.path_is_single_rect = false;
+        self.path_subpaths = 0;
+        self.path_rect_axis = false;
         self.pending_clip = false;
+        self.pending_clip_even_odd = false;
     }
 
     /// Record an image (unit square under `ctm`).
@@ -311,6 +387,7 @@ impl VisibilityTracker {
             alpha: self.current.fill_alpha,
             masked,
             paint_order,
+            clip_kind: self.current.clip_kind,
         });
     }
 
@@ -334,6 +411,7 @@ impl VisibilityTracker {
             blend_non_normal: self.current.blend_non_normal,
             clip_coverage,
             paint_order: self.next_order(),
+            clip_kind: self.current.clip_kind,
         }
     }
 }
@@ -474,7 +552,7 @@ mod tests {
         let mut t = VisibilityTracker::default();
         t.path_point(&Matrix::identity(), 10.0, 10.0);
         t.path_segment(true);
-        t.mark_clip();
+        t.mark_clip(false);
         t.end_path(false, false, None);
         let v = t.span_facts(0, &Rect::new(0.0, 0.0, 50.0, 12.0));
         assert_eq!(v.clip_coverage, 0.0);
@@ -505,5 +583,57 @@ mod tests {
         assert_eq!(t.paints.len(), 1);
         assert_eq!(t.paints[0].kind, PaintKind::Rect);
         assert_eq!(t.paints[0].bbox, Rect::new(0.0, 0.0, 100.0, 20.0));
+    }
+
+    fn clip_rect(t: &mut VisibilityTracker, even_odd: bool) {
+        let m = Matrix::identity();
+        t.path_point(&m, 0.0, 0.0);
+        t.path_point(&m, 10.0, 10.0);
+        t.path_rect_ctm(&m);
+        t.path_segment(true);
+        t.mark_clip(even_odd);
+        t.end_path(false, false, None);
+    }
+
+    #[test]
+    fn clip_kind_nested_q_restores_and_takes_max() {
+        let mut t = VisibilityTracker::default();
+        let bbox = Rect::new(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(t.span_facts(0, &bbox).clip_kind, ClipKind::None);
+        t.save();
+        clip_rect(&mut t, true);
+        assert_eq!(t.span_facts(0, &bbox).clip_kind, ClipKind::Rect);
+        t.save();
+        let m = Matrix::identity();
+        for _ in 0..2 {
+            t.path_point(&m, 0.0, 0.0);
+            t.path_point(&m, 5.0, 5.0);
+            t.path_move();
+        }
+        t.mark_clip(true);
+        t.end_path(false, false, None);
+        assert_eq!(t.span_facts(0, &bbox).clip_kind, ClipKind::EvenOdd);
+        t.restore();
+        assert_eq!(t.span_facts(0, &bbox).clip_kind, ClipKind::Rect);
+        t.restore();
+        assert_eq!(t.span_facts(0, &bbox).clip_kind, ClipKind::None);
+    }
+
+    #[test]
+    fn clip_kind_empty_clip_is_rect_and_rotated_form_bbox_is_path() {
+        let mut t = VisibilityTracker::default();
+        t.mark_clip(false);
+        t.end_path(false, false, None);
+        assert_eq!(t.current.clip_kind, ClipKind::Rect);
+        let rot = Matrix {
+            a: 0.7,
+            b: 0.7,
+            c: -0.7,
+            d: 0.7,
+            e: 0.0,
+            f: 0.0,
+        };
+        t.clip_to(&rot, 0.0, 0.0, 1.0, 1.0);
+        assert_eq!(t.current.clip_kind, ClipKind::Path);
     }
 }

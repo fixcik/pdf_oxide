@@ -5539,6 +5539,9 @@ impl<'doc> TextExtractor<'doc> {
             },
             Operator::MoveTo { x, y } | Operator::LineTo { x, y } => {
                 if let Some(v) = self.vis.as_mut() {
+                    if matches!(op, Operator::MoveTo { .. }) {
+                        v.path_move();
+                    }
                     v.path_point(&ctm, *x, *y);
                     v.path_segment(false);
                 }
@@ -5587,6 +5590,7 @@ impl<'doc> TextExtractor<'doc> {
                     v.path_point(&ctm, x + width, *y);
                     v.path_point(&ctm, x + width, y + height);
                     v.path_point(&ctm, *x, y + height);
+                    v.path_rect_ctm(&ctm);
                     v.path_segment(true);
                 }
                 return Ok(true);
@@ -5594,7 +5598,7 @@ impl<'doc> TextExtractor<'doc> {
             Operator::ClosePath => return Ok(true),
             Operator::ClipNonZero | Operator::ClipEvenOdd => {
                 if let Some(v) = self.vis.as_mut() {
-                    v.mark_clip();
+                    v.mark_clip(matches!(op, Operator::ClipEvenOdd));
                 }
                 return Ok(true);
             },
