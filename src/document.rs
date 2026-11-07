@@ -589,6 +589,10 @@ pub struct PdfDocument {
     /// Whether `postprocess_spans` refines `TextSpan::char_x_offsets` from a
     /// second, per-character pass over the page content (default: on).
     refine_char_x_offsets: std::sync::atomic::AtomicBool,
+    /// Whether span extraction collects visibility facts (default: off).
+    visibility_facts: std::sync::atomic::AtomicBool,
+    /// Per-page visibility facts from the last extraction with facts on.
+    page_visibility: Mutex<HashMap<usize, crate::extractors::visibility::PageVisibility>>,
     /// Per-page lightweight search index (page text + span bounding boxes,
     /// no fonts/glyph widths) built lazily by `search()`/`search_page()` and
     /// reused across repeated calls on the same document. Unlike
@@ -1363,6 +1367,8 @@ impl PdfDocument {
             signatures_compute_lock: Mutex::new(()),
             struct_tree_compute_lock: Mutex::new(()),
             refine_char_x_offsets: std::sync::atomic::AtomicBool::new(true),
+            visibility_facts: std::sync::atomic::AtomicBool::new(false),
+            page_visibility: Mutex::new(HashMap::new()),
             search_index: Mutex::new(HashMap::new()),
             page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
@@ -7480,6 +7486,44 @@ impl PdfDocument {
         self.search_index.lock_or_recover().clear();
     }
 
+    /// Enable or disable collection of visibility facts for hidden-text
+    /// filtering (see [`crate::extractors::visibility`]).
+    ///
+    /// When on, every span from the span-based extractors (`extract_spans*`,
+    /// `extract_structured*`, …) carries
+    /// [`TextSpan::visibility`](crate::layout::TextSpan::visibility) (render
+    /// mode, fill/stroke alpha, soft mask, clip coverage, paint order), and
+    /// [`page_visibility`](Self::page_visibility) returns the page's fills,
+    /// images and shadings in the same paint order plus the off-page drop
+    /// count. Collecting them routes the content stream through the full
+    /// operator parser and keeps runs whose facts differ from being merged or
+    /// de-duplicated into one another, so extracted text can differ slightly
+    /// from the default. Default: off — output is then byte-identical to a
+    /// build without the feature. Clears the span caches so the setting takes
+    /// effect for subsequent calls.
+    pub fn set_visibility_facts(&self, enabled: bool) {
+        self.visibility_facts.store(enabled, Ordering::Relaxed);
+        self.page_spans_cache.lock_or_recover().clear();
+        self.page_raw_spans_cache.lock_or_recover().clear();
+        self.search_index.lock_or_recover().clear();
+        self.page_visibility.lock_or_recover().clear();
+    }
+
+    /// Page-level visibility facts recorded by the last span extraction of
+    /// `page_index` while [`set_visibility_facts`](Self::set_visibility_facts)
+    /// was on; `None` if the page has not been extracted with facts on (or
+    /// carries no text, so extraction stopped before the content walk).
+    /// Kept per page for the document's lifetime (a few KB per page).
+    pub fn page_visibility(
+        &self,
+        page_index: usize,
+    ) -> Option<crate::extractors::visibility::PageVisibility> {
+        self.page_visibility
+            .lock_or_recover()
+            .get(&page_index)
+            .cloned()
+    }
+
     /// Mark a specific rectangular region on a page for erasure.
     ///
     /// Content in this region will be excluded from all subsequent text extractions.
@@ -10182,6 +10226,7 @@ impl PdfDocument {
 
             spans.push(TextSpan {
                 provenance: None,
+                visibility: None,
                 artifact_type: None,
                 text,
                 bbox: rect,
@@ -10355,6 +10400,7 @@ impl PdfDocument {
 
             spans.push(TextSpan {
                 provenance: None,
+                visibility: None,
                 artifact_type: None,
                 text,
                 bbox: rect,
@@ -13083,13 +13129,25 @@ impl PdfDocument {
             let right = llx.max(urx) + EDGE_TOLERANCE_PT;
             let bottom = lly.min(ury) - EDGE_TOLERANCE_PT;
             let top = lly.max(ury) + EDGE_TOLERANCE_PT;
-            spans.retain(|span| {
+            let on_page = |span: &crate::layout::TextSpan| {
                 let sx1 = span.bbox.x;
                 let sx2 = span.bbox.x + span.bbox.width;
                 let sy1 = span.bbox.y;
                 let sy2 = span.bbox.y + span.bbox.height;
                 sx2 > left && sx1 < right && sy2 > bottom && sy1 < top
-            });
+            };
+            if self.visibility_facts.load(Ordering::Relaxed) {
+                let (mut n, mut chars) = (0usize, 0usize);
+                for s in spans.iter().filter(|s| !on_page(s)) {
+                    n += 1;
+                    chars += s.text.chars().filter(|c| !c.is_whitespace()).count();
+                }
+                let mut pv = self.page_visibility.lock_or_recover();
+                let e = pv.entry(page_index).or_default();
+                e.offpage_spans = n;
+                e.offpage_chars = chars;
+            }
+            spans.retain(on_page);
         }
     }
 
@@ -17351,6 +17409,10 @@ impl PdfDocument {
         // by default; Form XObject Do invocations push their own scope
         // on top of the stack inside the extractor.
         extractor.set_page_index(page_index as u32);
+        let visibility_facts = self.visibility_facts.load(Ordering::Relaxed);
+        if visibility_facts {
+            extractor.enable_visibility_facts();
+        }
         if !excluded_layers.is_empty() {
             extractor.set_excluded_layers(excluded_layers);
         }
@@ -17370,6 +17432,14 @@ impl PdfDocument {
         }
 
         let spans = extractor.extract_text_spans(&content_data)?;
+        if visibility_facts {
+            let paints = extractor.take_paint_events();
+            self.page_visibility
+                .lock_or_recover()
+                .entry(page_index)
+                .or_default()
+                .paints = paints;
+        }
         // Drain MCIDs whose in-stream /ActualText was applied during
         // extraction and stash on the document so the struct-tree-
         // scope applier honours MC-scope-wins precedence (§14.9.4).
@@ -17777,6 +17847,38 @@ impl PdfDocument {
             media_box.3,
             spans,
             column_mode,
+            &struct_info,
+        ))
+    }
+
+    /// [`extract_structured`](Self::extract_structured) with optional-content
+    /// layers and/or Separation/DeviceN inks excluded — the structured
+    /// counterpart of
+    /// [`extract_spans_filtered_with_reading_order`](Self::extract_spans_filtered_with_reading_order).
+    /// Pass `optional_content::compute_default_off_ocgs(&doc)` as
+    /// `excluded_layers` to drop what the page does not display by default
+    /// (`BDC /OC` sequences and XObjects whose `/OC` is hidden). Empty sets
+    /// are exactly [`extract_structured`](Self::extract_structured).
+    pub fn extract_structured_filtered(
+        &self,
+        page_index: usize,
+        excluded_layers: HashSet<String>,
+        excluded_inks: HashSet<String>,
+    ) -> Result<crate::structured::StructuredPage> {
+        let spans = self.extract_spans_filtered_with_reading_order(
+            page_index,
+            ReadingOrder::default(),
+            excluded_layers,
+            excluded_inks,
+        )?;
+        let media_box = self.get_page_media_box(page_index)?;
+        let struct_info = self.structured_mcid_info(page_index);
+        Ok(crate::structured::build_structured_page_full(
+            page_index,
+            media_box.2,
+            media_box.3,
+            spans,
+            crate::structured::ColumnMode::Auto,
             &struct_info,
         ))
     }
@@ -19868,6 +19970,7 @@ impl PdfDocument {
             .into_iter()
             .map(|w| crate::layout::TextSpan {
                 provenance: None,
+                visibility: None,
                 artifact_type: None,
                 text: w.text,
                 bbox: w.bbox,
@@ -27667,6 +27770,7 @@ mod tests {
     fn make_test_span(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),
@@ -28201,6 +28305,7 @@ mod tests {
     ) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             text: text.to_string(),
             bbox: crate::geometry::Rect {
@@ -32281,6 +32386,7 @@ mod tests {
         fn make_span(label: &str, x: f32, y: f32) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: label.to_string(),
@@ -32370,6 +32476,7 @@ mod tests {
         fn make_span(label: &str, x: f32, y: f32, sequence: usize) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
@@ -32449,6 +32556,7 @@ mod tests {
         fn make_cell(label: &str, x: f32, y: f32, sequence: usize) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
@@ -32517,6 +32625,7 @@ mod tests {
         use crate::layout::{Color, FontWeight, TextSpan};
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),
@@ -33250,6 +33359,7 @@ mod tests {
         fn mk(text: &str, x: f32, y: f32, w: f32) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: text.to_string(),
@@ -33313,6 +33423,7 @@ mod tests {
         fn mk(text: &str, x: f32, y: f32, w: f32) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: text.to_string(),
@@ -33390,6 +33501,7 @@ mod tests {
         fn mk(text: &str, x: f32, y: f32) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: text.to_string(),
@@ -33466,6 +33578,7 @@ mod tests {
         fn mk(text: &str, x: f32, y: f32, w: f32) -> TextSpan {
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: text.to_string(),
@@ -34529,6 +34642,7 @@ mod soft_hyphen_seam_tests {
     fn seam_span(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             text: text.to_string(),
             bbox: crate::geometry::Rect {

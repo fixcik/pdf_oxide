@@ -23,6 +23,7 @@ use pdf_oxide::layout::{Color, FontWeight, TextSpan};
 fn create_test_span(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextSpan {
     TextSpan {
         provenance: None,
+        visibility: None,
         artifact_type: None,
         text: text.to_string(),
         bbox: Rect::new(x, y, width, height),

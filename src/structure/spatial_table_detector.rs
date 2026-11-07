@@ -4935,6 +4935,7 @@ mod tests {
     fn create_test_span(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),
@@ -7620,6 +7621,7 @@ mod tests {
     fn ts(text: &str, x: f32, y: f32, width: f32, fs: f32) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),

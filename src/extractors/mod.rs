@@ -16,6 +16,7 @@ pub mod status;
 pub mod structured;
 pub mod synthetic_structure;
 pub mod text;
+pub mod visibility;
 pub mod warnings;
 pub mod xmp;
 
@@ -49,5 +50,6 @@ pub use structured::{
 };
 pub use synthetic_structure::{SyntheticStructureConfig, SyntheticStructureGenerator};
 pub use text::{SpanMergingConfig, TextExtractionConfig, TextExtractor};
+pub use visibility::{PageVisibility, PaintEvent, PaintKind, SpanVisibility};
 pub use warnings::{Warning, WarningCategory, WarningSink};
 pub use xmp::{XmpExtractor, XmpMetadata};

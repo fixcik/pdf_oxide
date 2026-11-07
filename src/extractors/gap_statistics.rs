@@ -823,6 +823,7 @@ mod tests {
         let spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -853,6 +854,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "World".to_string(),
@@ -968,6 +970,7 @@ mod tests {
         let spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "A".to_string(),
@@ -998,6 +1001,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "B".to_string(),

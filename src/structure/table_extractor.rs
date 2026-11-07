@@ -837,6 +837,7 @@ fn extract_cell(
                     };
                     cell_spans.push(TextSpan {
                         provenance: None,
+                        visibility: None,
                         artifact_type: None,
                         text: span_text,
                         bbox: block.bbox,
@@ -1208,6 +1209,7 @@ mod tests {
 
         crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),
@@ -1406,6 +1408,7 @@ mod tests {
         //   "peu/d" x=364.39 w=25.24             gap=0.00  (touching → no space)
         let base = crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: String::new(),
@@ -1486,6 +1489,7 @@ mod tests {
 
         let base = crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: String::new(),
@@ -1565,6 +1569,7 @@ mod tests {
 
         let base = crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: String::new(),
@@ -1653,6 +1658,7 @@ mod tests {
 
         let span = crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             mirrored: false,
             page_rotation_applied: 0,
@@ -1726,6 +1732,7 @@ mod tests {
 
         let base = crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: String::new(),
@@ -1814,6 +1821,7 @@ mod tests {
 
         let base = crate::layout::TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: String::new(),

@@ -278,6 +278,7 @@ mod tests {
     fn make_span(text: &str, x: f32, y: f32, mcid: Option<u32>) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),

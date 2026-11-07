@@ -2531,6 +2531,7 @@ mod tests {
 
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),

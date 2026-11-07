@@ -24,6 +24,7 @@ fn make_span(text: &str, x: f32, y: f32, font_size: f32, weight: FontWeight) -> 
     OrderedTextSpan::new(
         TextSpan {
             provenance: None,
+            visibility: None,
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, 50.0, font_size),
@@ -68,6 +69,7 @@ fn make_span_with_color(
     OrderedTextSpan::new(
         TextSpan {
             provenance: None,
+            visibility: None,
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, 50.0, font_size),
@@ -112,6 +114,7 @@ fn make_span_italic(
     OrderedTextSpan::new(
         TextSpan {
             provenance: None,
+            visibility: None,
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, 50.0, font_size),

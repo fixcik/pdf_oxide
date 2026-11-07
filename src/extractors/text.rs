@@ -2401,6 +2401,10 @@ pub struct TextExtractor<'doc> {
     /// covers `Pattern(_)` in the data model so future pattern-content
     /// walks can populate it.
     mcid_scope_stack: Vec<crate::structure::McidScope>,
+    /// Visibility-facts tracker; `Some` only when the caller opted in
+    /// (`PdfDocument::set_visibility_facts`). `None` keeps every code path
+    /// and output identical to an extractor without the feature.
+    vis: Option<Box<crate::extractors::visibility::VisibilityTracker>>,
 }
 
 impl<'doc> TextExtractor<'doc> {
@@ -2491,7 +2495,32 @@ impl<'doc> TextExtractor<'doc> {
             // extraction. Form XObject `Do` invocations push their
             // own scope on top.
             mcid_scope_stack: vec![crate::structure::McidScope::Page(0)],
+            vis: None,
         }
+    }
+
+    /// Collect visibility facts during the next extraction (see
+    /// [`crate::extractors::visibility`]). Routes the content stream through
+    /// the full operator parser, which the facts need.
+    pub(crate) fn enable_visibility_facts(&mut self) {
+        self.vis = Some(Box::default());
+    }
+
+    /// Paint events collected since `enable_visibility_facts`.
+    pub(crate) fn take_paint_events(&mut self) -> Vec<crate::extractors::visibility::PaintEvent> {
+        self.vis
+            .as_mut()
+            .map(|v| std::mem::take(&mut v.paints))
+            .unwrap_or_default()
+    }
+
+    /// Append an emitted span, stamping its visibility facts when enabled.
+    fn push_span(&mut self, mut span: TextSpan) {
+        if let Some(vis) = self.vis.as_mut() {
+            let render_mode = self.state_stack.current().render_mode;
+            span.visibility = Some(vis.span_facts(render_mode, &span.bbox));
+        }
+        self.spans.push(span);
     }
 
     /// Stamp this extractor with the page index it is processing.
@@ -3574,7 +3603,9 @@ impl<'doc> TextExtractor<'doc> {
     /// answer is one sequential interpreter with suppression at emission,
     /// which retires this predicate along with the prescan branch.
     fn has_emission_filter(&self) -> bool {
-        !self.excluded_inks.is_empty() || !self.excluded_layers.is_empty()
+        // Visibility facts need the path, clip and `gs` operators the
+        // text-only parser skips, so they take the full parser too.
+        !self.excluded_inks.is_empty() || !self.excluded_layers.is_empty() || self.vis.is_some()
     }
 
     fn run_content_stream(&mut self, content_stream: &[u8]) -> Result<()> {
@@ -4073,6 +4104,7 @@ impl<'doc> TextExtractor<'doc> {
         let mut prev_y_rounded: Option<i32> = None;
         let mut prev_x: Option<f32> = None;
         let mut prev_text: Option<String> = None;
+        let mut prev_vis: Option<crate::extractors::visibility::SpanVisibility> = None;
         // Every place a given string has been kept, not merely the last one.
         //
         // One slot per string cannot see an overprint. A page that draws each
@@ -4083,8 +4115,12 @@ impl<'doc> TextExtractor<'doc> {
         // pass then compares its `S` against the wrong one and finds no
         // duplicate.
         const MAX_TRACKED_POSITIONS: usize = 32;
-        let mut seen_content: std::collections::HashMap<String, Vec<(f32, f32)>> =
+        type Seen = (f32, f32, Option<crate::extractors::visibility::SpanVisibility>);
+        let mut seen_content: std::collections::HashMap<String, Vec<Seen>> =
             std::collections::HashMap::new();
+        // With visibility facts on, a hidden copy never stands in for a
+        // visible one (always false when facts are off).
+        let differ = crate::extractors::visibility::facts_differ;
 
         let mut geometric_skips = 0;
         let mut content_skips = 0;
@@ -4104,7 +4140,10 @@ impl<'doc> TextExtractor<'doc> {
                 let per_glyph_width = (span.bbox.width / char_count).max(0.1);
                 let threshold =
                     (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
-                y_rounded == prev_y && (x - prev_x_val).abs() < threshold && span.text == *prev_txt
+                y_rounded == prev_y
+                    && (x - prev_x_val).abs() < threshold
+                    && span.text == *prev_txt
+                    && !differ(&prev_vis, &span.visibility)
             } else {
                 false
             };
@@ -4135,9 +4174,10 @@ impl<'doc> TextExtractor<'doc> {
                     (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT)
                 };
                 seen_content.get(&span.text).is_some_and(|seen| {
-                    seen.iter().any(|(prev_x_val, prev_y_val)| {
+                    seen.iter().any(|(prev_x_val, prev_y_val, vis)| {
                         (span.bbox.y - prev_y_val).abs() < 2.0
                             && (span.bbox.x - prev_x_val).abs() < x_bar
+                            && !differ(vis, &span.visibility)
                     })
                 })
             };
@@ -4150,6 +4190,7 @@ impl<'doc> TextExtractor<'doc> {
                 prev_y_rounded = Some(y_rounded);
                 prev_x = Some(x);
                 prev_text = Some(span.text.clone());
+                prev_vis = span.visibility;
 
                 // Track content for duplicate detection. Bounded, so a page
                 // repeating one string thousands of times cannot grow this
@@ -4157,7 +4198,7 @@ impl<'doc> TextExtractor<'doc> {
                 // the recent ones.
                 let at = seen_content.entry(span.text.clone()).or_default();
                 if at.len() < MAX_TRACKED_POSITIONS {
-                    at.push((span.bbox.x, span.bbox.y));
+                    at.push((span.bbox.x, span.bbox.y, span.visibility));
                 }
                 // Move span instead of cloning
                 deduplicated.push(span);
@@ -4201,7 +4242,10 @@ impl<'doc> TextExtractor<'doc> {
         // finds every match the full scan would. Only runs for text ≥ 2 chars
         // (shorter candidates rely on downstream positional dedup).
         const CELL: f32 = 16.0;
-        type Grid = HashMap<(i32, i32), Vec<crate::geometry::Rect>>;
+        type Grid = HashMap<
+            (i32, i32),
+            Vec<(crate::geometry::Rect, Option<crate::extractors::visibility::SpanVisibility>)>,
+        >;
         let mut seen: HashMap<String, Grid> = HashMap::new();
         let mut kept: Vec<TextSpan> = Vec::with_capacity(old_len);
         let mut skipped = 0usize;
@@ -4225,7 +4269,15 @@ impl<'doc> TextExtractor<'doc> {
                         let Some(others) = grid.get(&(gx, gy)) else {
                             continue;
                         };
-                        for other in others {
+                        for (other, other_vis) in others {
+                            // A hidden copy never stands in for a visible one
+                            // (always false when visibility facts are off).
+                            if crate::extractors::visibility::facts_differ(
+                                other_vis,
+                                &span.visibility,
+                            ) {
+                                continue;
+                            }
                             // IoU — intersection over union. >= 0.7 means the
                             // two bboxes are almost the same rectangle, which is
                             // what stroke+fill produces.
@@ -4255,7 +4307,7 @@ impl<'doc> TextExtractor<'doc> {
                     .or_default()
                     .entry((cx, cy))
                     .or_default()
-                    .push(b);
+                    .push((b, span.visibility));
                 kept.push(span);
             }
         }
@@ -4505,7 +4557,13 @@ impl<'doc> TextExtractor<'doc> {
             let rotation_compatible =
                 current.rotation_degrees == 0.0 && span.rotation_degrees == 0.0;
             let y_diff = (span.bbox.y - current.bbox.y).abs();
-            let same_line = y_diff < 1.0 && wmode_compatible && rotation_compatible;
+            // With visibility facts on, a visible run never absorbs a hidden
+            // one (or vice versa) — the merged span would carry only one side's
+            // facts. No-op when facts are off (both `None`).
+            let facts_compatible =
+                !crate::extractors::visibility::facts_differ(&current.visibility, &span.visibility);
+            let same_line =
+                y_diff < 1.0 && wmode_compatible && rotation_compatible && facts_compatible;
 
             // Gap between end of current span and start of next span
             let current_end_x = current.bbox.x + current.bbox.width;
@@ -5286,7 +5344,301 @@ impl<'doc> TextExtractor<'doc> {
     /// Execute a single operator.
     ///
     /// Updates the graphics state and extracts text as appropriate.
+    /// Visibility-facts hook, run before `execute_operator`'s own handling
+    /// while facts are enabled. Returns `true` when the operator is fully
+    /// handled here (path construction/painting, which the extractor
+    /// otherwise ignores).
+    fn observe_visibility(&mut self, op: &Operator) -> Result<bool> {
+        let ctm = self.state_stack.current().ctm;
+        match op {
+            Operator::Tr { render } => {
+                // A render-mode change must start a new span so each span
+                // carries the mode it was drawn under.
+                if *render != self.state_stack.current().render_mode {
+                    self.flush_tj_span_buffer()?;
+                }
+            },
+            Operator::SaveState => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.save();
+                }
+            },
+            Operator::RestoreState => {
+                // Flush under the inner state before it is popped.
+                self.flush_tj_span_buffer()?;
+                if let Some(v) = self.vis.as_mut() {
+                    v.restore();
+                }
+            },
+            Operator::SetExtGState { dict_name } => {
+                self.flush_tj_span_buffer()?;
+                self.apply_ext_gstate(dict_name);
+            },
+            Operator::MoveTo { x, y } | Operator::LineTo { x, y } => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.path_point(&ctm, *x, *y);
+                    v.path_segment(false);
+                }
+                return Ok(true);
+            },
+            Operator::CurveTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                x3,
+                y3,
+            } => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.path_point(&ctm, *x1, *y1);
+                    v.path_point(&ctm, *x2, *y2);
+                    v.path_point(&ctm, *x3, *y3);
+                    v.path_segment(false);
+                }
+                return Ok(true);
+            },
+            Operator::CurveToV { x2, y2, x3, y3 } => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.path_point(&ctm, *x2, *y2);
+                    v.path_point(&ctm, *x3, *y3);
+                    v.path_segment(false);
+                }
+                return Ok(true);
+            },
+            Operator::CurveToY { x1, y1, x3, y3 } => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.path_point(&ctm, *x1, *y1);
+                    v.path_point(&ctm, *x3, *y3);
+                    v.path_segment(false);
+                }
+                return Ok(true);
+            },
+            Operator::Rectangle {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.path_point(&ctm, *x, *y);
+                    v.path_point(&ctm, x + width, *y);
+                    v.path_point(&ctm, x + width, y + height);
+                    v.path_point(&ctm, *x, y + height);
+                    v.path_segment(true);
+                }
+                return Ok(true);
+            },
+            Operator::ClosePath => return Ok(true),
+            Operator::ClipNonZero | Operator::ClipEvenOdd => {
+                if let Some(v) = self.vis.as_mut() {
+                    v.mark_clip();
+                }
+                return Ok(true);
+            },
+            Operator::Fill
+            | Operator::FillEvenOdd
+            | Operator::FillStroke
+            | Operator::FillStrokeEvenOdd
+            | Operator::CloseFillStroke
+            | Operator::CloseFillStrokeEvenOdd
+            | Operator::Stroke
+            | Operator::CloseAndStroke
+            | Operator::EndPath => {
+                let fill =
+                    !matches!(op, Operator::Stroke | Operator::CloseAndStroke | Operator::EndPath);
+                let suppressed = self.is_content_suppressed();
+                let state = self.state_stack.current();
+                let color = (state.fill_color_space != "Pattern").then(|| {
+                    let (r, g, b) = state.fill_color_rgb;
+                    Color::new(r, g, b)
+                });
+                if let Some(v) = self.vis.as_mut() {
+                    v.end_path(fill, suppressed, color);
+                }
+                return Ok(true);
+            },
+            Operator::PaintShading { .. } => {
+                if !self.is_content_suppressed() {
+                    if let Some(v) = self.vis.as_mut() {
+                        v.shading();
+                    }
+                }
+            },
+            Operator::InlineImage { dict, .. } => {
+                let masked = ["IM", "ImageMask"]
+                    .iter()
+                    .any(|k| dict.get(*k).and_then(|o| o.as_bool()) == Some(true));
+                if !self.is_content_suppressed() {
+                    if let Some(v) = self.vis.as_mut() {
+                        v.image(&ctm, masked);
+                    }
+                }
+            },
+            _ => {},
+        }
+        Ok(false)
+    }
+
+    /// Resolve `/Resources/<category>/<name>` (following references).
+    fn resolve_resource_entry(&self, category: &str, name: &str) -> Option<Object> {
+        let doc = self.document?;
+        let resources = self.resources.as_ref()?;
+        let loaded_res;
+        let res = match resources.as_reference() {
+            Some(r) => {
+                loaded_res = doc.load_object(r).ok()?;
+                &loaded_res
+            },
+            None => resources,
+        };
+        let cat = res.as_dict()?.get(category)?;
+        let loaded_cat;
+        let cat = match cat.as_reference() {
+            Some(r) => {
+                loaded_cat = doc.load_object(r).ok()?;
+                &loaded_cat
+            },
+            None => cat,
+        };
+        let entry = cat.as_dict()?.get(name)?;
+        match entry.as_reference() {
+            Some(r) => doc.load_object(r).ok(),
+            None => Some(entry.clone()),
+        }
+    }
+
+    /// Apply the transparency entries of ExtGState `name` (ISO 32000-1
+    /// §8.4.5, Table 58: `/ca`, `/CA`, `/SMask`, `/BM`) to the tracker.
+    fn apply_ext_gstate(&mut self, name: &str) {
+        let Some(gs) = self.resolve_resource_entry("ExtGState", name) else {
+            return;
+        };
+        let Some(d) = gs.as_dict() else {
+            return;
+        };
+        let num = |k: &str| -> Option<f32> {
+            match d.get(k)? {
+                Object::Real(v) => Some(*v as f32),
+                Object::Integer(v) => Some(*v as f32),
+                _ => None,
+            }
+        };
+        let (fill, stroke) = (num("ca"), num("CA"));
+        let soft_mask = d
+            .get("SMask")
+            .map(|m| m.as_name() != Some("None") && !m.is_null());
+        let blend = d.get("BM").map(|bm| {
+            let first = match bm {
+                Object::Array(a) => a.first().and_then(|o| o.as_name()),
+                other => other.as_name(),
+            };
+            !matches!(first, None | Some("Normal") | Some("Compatible"))
+        });
+        if let Some(v) = self.vis.as_mut() {
+            v.set_alpha(fill, stroke);
+            if let Some(m) = soft_mask {
+                v.set_soft_mask(m);
+            }
+            if let Some(b) = blend {
+                v.set_blend_non_normal(b);
+            }
+        }
+    }
+
+    /// The XObject dict carries `/OC` naming an excluded layer (§8.11.3.3:
+    /// such an XObject is not drawn).
+    fn xobject_oc_hidden(&self, dict: &HashMap<String, Object>) -> bool {
+        if self.excluded_layers.is_empty() {
+            return false;
+        }
+        let (Some(oc), Some(doc)) = (dict.get("OC"), self.document) else {
+            return false;
+        };
+        let resolved = match oc.as_reference() {
+            Some(r) => doc.load_object(r).ok(),
+            None => Some(oc.clone()),
+        };
+        resolved
+            .as_ref()
+            .and_then(|o| o.as_dict())
+            .is_some_and(|d| self.check_ocg_excluded(d))
+    }
+
+    /// Record an image or text-free form XObject as a paint event.
+    fn record_xobject_paint(&mut self, xobject_ref: ObjectRef) {
+        if self.vis.is_none() || self.is_content_suppressed() {
+            return;
+        }
+        let Some(doc) = self.document else {
+            return;
+        };
+        let Ok(obj) = doc.load_object(xobject_ref) else {
+            return;
+        };
+        let Some(d) = obj.as_dict() else {
+            return;
+        };
+        if self.xobject_oc_hidden(d) {
+            return;
+        }
+        let ctm = self.state_stack.current().ctm;
+        match d.get("Subtype").and_then(|s| s.as_name()) {
+            Some("Image") => {
+                let masked = d.get("SMask").is_some_and(|m| !m.is_null())
+                    || d.get("Mask").is_some_and(|m| !m.is_null())
+                    || d.get("ImageMask").and_then(|o| o.as_bool()) == Some(true);
+                if let Some(v) = self.vis.as_mut() {
+                    v.image(&ctm, masked);
+                }
+            },
+            Some("Form") => {
+                let bbox = match d.get("BBox") {
+                    Some(Object::Array(a)) if a.len() >= 4 => {
+                        let f = |i: usize| match a.get(i) {
+                            Some(Object::Real(v)) => *v as f32,
+                            Some(Object::Integer(v)) => *v as f32,
+                            _ => 0.0,
+                        };
+                        [
+                            f(0).min(f(2)),
+                            f(1).min(f(3)),
+                            f(0).max(f(2)),
+                            f(1).max(f(3)),
+                        ]
+                    },
+                    _ => return,
+                };
+                let matrix = match d.get("Matrix") {
+                    Some(Object::Array(a)) if a.len() >= 6 => {
+                        let f = |i: usize| match a.get(i) {
+                            Some(Object::Real(v)) => *v as f32,
+                            Some(Object::Integer(v)) => *v as f32,
+                            _ => 0.0,
+                        };
+                        Matrix {
+                            a: f(0),
+                            b: f(1),
+                            c: f(2),
+                            d: f(3),
+                            e: f(4),
+                            f: f(5),
+                        }
+                    },
+                    _ => Matrix::identity(),
+                };
+                let form_ctm = matrix.multiply(&ctm);
+                if let Some(v) = self.vis.as_mut() {
+                    v.form(&form_ctm, bbox);
+                }
+            },
+            _ => {},
+        }
+    }
+
     fn execute_operator(&mut self, op: Operator) -> Result<()> {
+        if self.vis.is_some() && self.observe_visibility(&op)? {
+            return Ok(());
+        }
         match op {
             // Text state operators
             Operator::Tf { font, size } => {
@@ -6775,6 +7127,7 @@ impl<'doc> TextExtractor<'doc> {
             .unwrap()
             .contains(&xobject_ref)
         {
+            self.record_xobject_paint(xobject_ref);
             return Ok(());
         }
 
@@ -6782,6 +7135,7 @@ impl<'doc> TextExtractor<'doc> {
         // Image XObjects can be megabytes of compressed pixel data — loading them
         // just to discover Subtype=Image is a major bottleneck (10-15ms per image).
         if !doc.is_form_xobject(xobject_ref) {
+            self.record_xobject_paint(xobject_ref);
             return Ok(());
         }
 
@@ -6796,7 +7150,12 @@ impl<'doc> TextExtractor<'doc> {
         //
         // `ctm_key` was already computed above for the `processed_xobjects` guard.
         let spans_cache_key = (xobject_ref, ctm_key);
-        let has_filters = !self.excluded_layers.is_empty() || !self.excluded_inks.is_empty();
+        // Cached spans carry the facts of the invocation that filled the
+        // cache (alpha, clip, OC are inherited from the caller at `Do`), so
+        // visibility facts bypass the cache like the emission filters do.
+        let has_filters = !self.excluded_layers.is_empty()
+            || !self.excluded_inks.is_empty()
+            || self.vis.is_some();
         if self.extract_spans && !has_filters {
             let cached_spans = {
                 doc.xobject_spans_cache
@@ -6827,6 +7186,12 @@ impl<'doc> TextExtractor<'doc> {
 
         let subtype = xobject_dict.get("Subtype").and_then(|s| s.as_name());
 
+        // Optional content on the XObject itself (§8.11.3.3): an XObject
+        // whose /OC is hidden is not drawn, text included.
+        if self.xobject_oc_hidden(xobject_dict) {
+            return Ok(());
+        }
+
         match subtype {
             Some("Form") => {
                 // Form XObject - extract text from it
@@ -6856,6 +7221,7 @@ impl<'doc> TextExtractor<'doc> {
                                     .lock()
                                     .unwrap()
                                     .insert(xobject_ref);
+                                self.record_xobject_paint(xobject_ref);
                                 return Ok(());
                             }
                         }
@@ -6920,6 +7286,7 @@ impl<'doc> TextExtractor<'doc> {
                         .lock()
                         .unwrap()
                         .insert(xobject_ref);
+                    self.record_xobject_paint(xobject_ref);
                     return Ok(());
                 }
 
@@ -7040,6 +7407,12 @@ impl<'doc> TextExtractor<'doc> {
                 // the form; the /BBox clip below maps the BBox through this same
                 // CTM so the comparison happens in one coordinate space.
                 let form_ctm = self.state_stack.current().ctm;
+                if let Some(v) = self.vis.as_mut() {
+                    v.save();
+                    if let Some([x0, y0, x1, y1]) = form_bbox {
+                        v.clip_to(&form_ctm, x0, y0, x1, y1);
+                    }
+                }
 
                 // Push the Form XObject scope (ISO 32000-1:2008
                 // §14.7.4.3). Every MCID emitted inside this form's
@@ -7051,7 +7424,12 @@ impl<'doc> TextExtractor<'doc> {
                     .push(crate::structure::McidScope::Form(xobject_ref));
 
                 self.xobject_depth += 1;
-                let parse_result = self.run_content_stream(&stream_data);
+                let mut parse_result = self.run_content_stream(&stream_data);
+                if self.vis.is_some() && parse_result.is_ok() {
+                    // Emit a form's unterminated text under the form's own
+                    // state, before the tracker pops it.
+                    parse_result = self.flush_tj_span_buffer();
+                }
                 self.xobject_depth -= 1;
                 // Pop the Form XObject scope pushed before the
                 // content-stream walk. Cleared regardless of parse
@@ -7195,6 +7573,9 @@ impl<'doc> TextExtractor<'doc> {
 
                 // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)
                 self.state_stack.restore();
+                if let Some(v) = self.vis.as_mut() {
+                    v.restore();
+                }
                 // Sync cached font with restored state
                 self.cached_current_font = self
                     .state_stack
@@ -7316,6 +7697,7 @@ impl<'doc> TextExtractor<'doc> {
 
         let span = TextSpan {
             provenance: None,
+            visibility: None,
             text,
             bbox: Rect {
                 x: buffer.user_pos_x,
@@ -7363,7 +7745,7 @@ impl<'doc> TextExtractor<'doc> {
         self.span_sequence_counter += 1;
 
         if !self.is_content_suppressed() {
-            self.spans.push(span);
+            self.push_span(span);
         }
         Ok(())
     }
@@ -7855,6 +8237,7 @@ impl<'doc> TextExtractor<'doc> {
         // Step 5: Create TextSpan with primary_detected flag
         let span = TextSpan {
             provenance: None,
+            visibility: None,
             text: unicode_text,
             bbox,
             font_name: state
@@ -7898,7 +8281,7 @@ impl<'doc> TextExtractor<'doc> {
         // Step 6: Increment sequence counter and add to spans
         self.span_sequence_counter += 1;
         if !self.is_content_suppressed() {
-            self.spans.push(span);
+            self.push_span(span);
         }
 
         Ok(())
@@ -8611,6 +8994,7 @@ impl<'doc> TextExtractor<'doc> {
         };
         let span = TextSpan {
             provenance: None,
+            visibility: None,
             text: " ".to_string(),
             bbox: Rect {
                 x: user_pos.x,
@@ -8661,7 +9045,7 @@ impl<'doc> TextExtractor<'doc> {
         log::trace!("PUSH space span with offset_semantic={}", span.offset_semantic);
 
         if !self.is_content_suppressed() {
-            self.spans.push(span);
+            self.push_span(span);
         }
 
         // Do NOT advance the text matrix here. The caller drives the
@@ -8869,6 +9253,7 @@ impl<'doc> TextExtractor<'doc> {
 
                 let span = TextSpan {
                     provenance: None,
+                    visibility: None,
                     text,
                     bbox: Rect {
                         x: buffer.user_pos_x,
@@ -8926,7 +9311,7 @@ impl<'doc> TextExtractor<'doc> {
                 );
 
                 if !self.is_content_suppressed() {
-                    self.spans.push(span);
+                    self.push_span(span);
                 }
             }
         }
@@ -10125,6 +10510,7 @@ mod tests {
         let spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "the".to_string(),
@@ -10160,6 +10546,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "General".to_string(),
@@ -11055,6 +11442,7 @@ mod tests {
     fn snap_span(text: &str, x: f32, y: f32, w: f32, fs: f32, seq: usize) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),
@@ -12070,6 +12458,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -12100,6 +12489,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -12155,6 +12545,7 @@ mod tests {
         let narrow_span =
             |glyph: char, x: f32, font_size: f32, advance: f32, seq: usize| TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: glyph.to_string(),
@@ -12218,6 +12609,7 @@ mod tests {
 
         let narrow_at = |x: f32, seq: usize| TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: "l".to_string(),
@@ -12277,6 +12669,7 @@ mod tests {
         for i in 0..10 {
             extractor.spans.push(TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: format!("Line {}", i),
@@ -12478,6 +12871,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -12508,6 +12902,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "World".to_string(),
@@ -12561,6 +12956,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
@@ -12591,6 +12987,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 mirrored: false,
                 page_rotation_applied: 0,
@@ -12638,6 +13035,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -12668,6 +13066,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "World".to_string(),
@@ -12717,6 +13116,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Left".to_string(),
@@ -12747,6 +13147,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Right".to_string(),
@@ -12789,6 +13190,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -12819,6 +13221,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: " ".to_string(),
@@ -12849,6 +13252,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "World".to_string(),
@@ -15285,6 +15689,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello World".to_string(), // >= 5 chars
@@ -15315,6 +15720,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello World".to_string(), // Same text, overlapping position
@@ -15355,6 +15761,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello World".to_string(),
@@ -15385,6 +15792,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello World".to_string(), // Same text but far apart
@@ -15485,6 +15893,7 @@ mod tests {
         let mut extractor = TextExtractor::new();
         extractor.spans = vec![TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: "theGeneral".to_string(),
@@ -15526,6 +15935,7 @@ mod tests {
         let mut extractor = TextExtractor::new();
         extractor.spans = vec![TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: "hello".to_string(),
@@ -15714,6 +16124,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Right Col".to_string(),
@@ -15744,6 +16155,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Left Col".to_string(),
@@ -15830,6 +16242,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello ".to_string(), // ends with space
@@ -15860,6 +16273,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: " World".to_string(), // starts with space
@@ -16166,6 +16580,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Line2".to_string(),
@@ -16196,6 +16611,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Line1".to_string(),
@@ -16408,6 +16824,7 @@ mod tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -16438,6 +16855,7 @@ mod tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: " ".to_string(), // offset_semantic space
@@ -16985,6 +17403,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "$0.00".to_string(),
@@ -17015,6 +17434,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "$0.00".to_string(),
@@ -17064,6 +17484,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "100".to_string(),
@@ -17094,6 +17515,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "200".to_string(),
@@ -17143,6 +17565,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hel".to_string(),
@@ -17173,6 +17596,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "lo".to_string(),
@@ -17228,6 +17652,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "123456".to_string(),
@@ -17258,6 +17683,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "72".to_string(),
@@ -17305,6 +17731,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "50".to_string(),
@@ -17335,6 +17762,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "00".to_string(),
@@ -17379,6 +17807,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "Hello".to_string(),
@@ -17409,6 +17838,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "72".to_string(),
@@ -17457,6 +17887,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "123456".to_string(),
@@ -17487,6 +17918,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "723".to_string(),
@@ -17530,6 +17962,7 @@ mod profile_based_space_tests {
     fn digit_test_span(text: &str, bbox: Rect, font_size: f32) -> TextSpan {
         TextSpan {
             provenance: None,
+            visibility: None,
             text_rise: 0.0,
             artifact_type: None,
             text: text.to_string(),
@@ -17664,6 +18097,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "1".to_string(),
@@ -17694,6 +18128,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "0".to_string(),
@@ -17751,6 +18186,7 @@ mod profile_based_space_tests {
         extractor.spans = vec![
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "1234".to_string(),
@@ -17781,6 +18217,7 @@ mod profile_based_space_tests {
             },
             TextSpan {
                 provenance: None,
+                visibility: None,
                 text_rise: 0.0,
                 artifact_type: None,
                 text: "56".to_string(),

@@ -177,6 +177,12 @@ pub struct TextSpan {
     /// bindings surface it through explicit accessors.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub provenance: Option<crate::fonts::MappingProvenance>,
+    /// Visibility facts (render mode, alpha, clip coverage, paint order) for
+    /// hidden-text filtering. `None` unless the document was opened with
+    /// [`PdfDocument::set_visibility_facts`](crate::document::PdfDocument::set_visibility_facts)
+    /// enabled; omitted from serialized output when `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub visibility: Option<crate::extractors::visibility::SpanVisibility>,
 }
 
 /// serde skip helper: omit a `false` flag (the common case) from serialized output.
@@ -227,6 +233,7 @@ impl Default for TextSpan {
             mirrored: false,
             page_rotation_applied: 0,
             provenance: None,
+            visibility: None,
         }
     }
 }

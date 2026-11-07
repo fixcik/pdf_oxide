@@ -34,6 +34,7 @@ fn create_test_span(
 ) -> TextSpan {
     TextSpan {
         provenance: None,
+        visibility: None,
         artifact_type: None,
         text: text.to_string(),
         bbox: Rect::new(x, y, width, height),
