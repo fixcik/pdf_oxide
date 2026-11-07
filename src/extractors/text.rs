@@ -5925,6 +5925,17 @@ impl<'doc> TextExtractor<'doc> {
                         // Per PDF Spec ISO 32000-1:2008, Section 9.4.4 NOTE 6:
                         // "text strings are as long as possible"
                         // This creates one span per logical text unit instead of fragmenting
+                        //
+                        // The array is assembled in its own buffer and
+                        // emitted on the spot, so a run still pending from
+                        // earlier `Tj` / `Tm`-continuation operators must be
+                        // closed first. Otherwise the array's text is emitted
+                        // ahead of glyphs drawn before it, and a `Tj` drawn
+                        // after it (often the word space) is appended to the
+                        // stale run at the start of the word (§9.4.3: each
+                        // show operator paints at the current pen position,
+                        // in stream order).
+                        self.flush_tj_span_buffer()?;
                         self.process_tj_array(&array)?;
                     } else {
                         // Keep old behavior for character extraction mode
