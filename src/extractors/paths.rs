@@ -43,6 +43,30 @@ use crate::elements::{LineCap, LineJoin, PathContent, PathOperation};
 use crate::geometry::{Point, Rect};
 use crate::layout::Color;
 
+/// Colour space kind of the current fill/stroke colour, as far as path
+/// extraction can map it to RGB. `Unknown` (Pattern, Separation, DeviceN,
+/// Indexed, Lab, unresolvable names) means the colour has no sound RGB value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathColorSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+    Unknown,
+}
+
+impl PathColorSpace {
+    /// Map `sc`/`scn` components to RGB; `None` when the count does not match
+    /// the space or the space is `Unknown`.
+    pub(crate) fn to_rgb(self, c: &[f32]) -> Option<(f32, f32, f32)> {
+        match (self, c.len()) {
+            (Self::Gray, 1) => Some((c[0], c[0], c[0])),
+            (Self::Rgb, 3) => Some((c[0], c[1], c[2])),
+            (Self::Cmyk, 4) => Some(crate::color::cmyk_to_rgb(c[0], c[1], c[2], c[3])),
+            _ => None,
+        }
+    }
+}
+
 /// Copy-only graphics state for path extraction (no String/Vec fields).
 /// Enables allocation-free q/Q save/restore unlike the full [`GraphicsState`].
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +74,8 @@ pub(crate) struct PathGraphicsState {
     pub ctm: Matrix,
     pub stroke_color_rgb: (f32, f32, f32),
     pub fill_color_rgb: (f32, f32, f32),
+    pub stroke_space: PathColorSpace,
+    pub fill_space: PathColorSpace,
     pub line_width: f32,
     pub line_cap: u8,
     pub line_join: u8,
@@ -61,6 +87,8 @@ impl PathGraphicsState {
             ctm: Matrix::identity(),
             stroke_color_rgb: (0.0, 0.0, 0.0),
             fill_color_rgb: (0.0, 0.0, 0.0),
+            stroke_space: PathColorSpace::Gray,
+            fill_space: PathColorSpace::Gray,
             line_width: 1.0,
             line_cap: 0,
             line_join: 0,
@@ -426,9 +454,11 @@ impl PathExtractor {
             _ => LineJoin::Miter,
         };
         let (r, g, b) = state.stroke_color_rgb;
-        self.current_stroke_color = Some(Color::new(r, g, b));
+        self.current_stroke_color =
+            (state.stroke_space != PathColorSpace::Unknown).then(|| Color::new(r, g, b));
         let (r, g, b) = state.fill_color_rgb;
-        self.current_fill_color = Some(Color::new(r, g, b));
+        self.current_fill_color =
+            (state.fill_space != PathColorSpace::Unknown).then(|| Color::new(r, g, b));
     }
 
     /// Set stroke color.
@@ -439,6 +469,16 @@ impl PathExtractor {
     /// Set fill color.
     pub fn set_fill_color(&mut self, color: Color) {
         self.current_fill_color = Some(color);
+    }
+
+    /// Mark the stroke colour as having no RGB value (Pattern, tint spaces).
+    pub(crate) fn clear_stroke_color(&mut self) {
+        self.current_stroke_color = None;
+    }
+
+    /// Mark the fill colour as having no RGB value (Pattern, tint spaces).
+    pub(crate) fn clear_fill_color(&mut self) {
+        self.current_fill_color = None;
     }
 
     /// Set line width.

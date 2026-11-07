@@ -352,10 +352,9 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                         b"B*" => Some(Operator::FillStrokeEvenOdd),
                         b"b*" => Some(Operator::CloseFillStrokeEvenOdd),
                         b"W*" => Some(Operator::ClipEvenOdd),
-                        // Skip text/color-space/shading operators that don't affect paths
+                        // Skip text/shading operators that don't affect paths
                         b"ET" | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tf" | b"Tr" | b"Ts" | b"Td"
-                        | b"TD" | b"Tm" | b"Tj" | b"TJ" | b"T*" | b"cs" | b"CS" | b"sc" | b"SC"
-                        | b"scn" | b"SCN" | b"ri" | b"sh" | b"EI" => {
+                        | b"TD" | b"Tm" | b"Tj" | b"TJ" | b"T*" | b"ri" | b"sh" | b"EI" => {
                             operand_start = i;
                             continue;
                         },
