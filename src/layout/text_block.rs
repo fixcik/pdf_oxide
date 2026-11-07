@@ -167,14 +167,17 @@ pub struct TextSpan {
     #[serde(skip)]
     pub page_rotation_applied: i32,
     /// `bbox` already is the run's physical hull, not its along-the-x-axis
-    /// extents: set for runs whose text matrix turns them upright against the
-    /// page `/Rotate` (content angle ≡ `/Rotate`, e.g. `0 -s s 0 Tm` under
-    /// `/Rotate 270`), which read as ordinary horizontal text on the displayed
-    /// page. In raw user space their `bbox` is then tall and narrow (where
-    /// the glyphs are drawn); once span postprocessing maps them into the
-    /// displayed frame it is wide and short again, with the writing axis
-    /// along x. [`Self::page_bbox`] returns `bbox` unchanged for them.
-    /// Runtime metadata — deliberately not serialized.
+    /// extents. Set on the raw-user-space spans of
+    /// `extract_spans_with_reading_order*` / `extract_structured*` for runs
+    /// whose text matrix turns them upright against the page `/Rotate`
+    /// (content angle ≡ `/Rotate`, e.g. `0 -s s 0 Tm` under `/Rotate 270`):
+    /// such a run reads as ordinary horizontal text on the displayed page, and
+    /// its `bbox` is then tall and narrow where the glyphs are drawn. The
+    /// displayed-frame spans of `extract_spans` keep their mapped box (use
+    /// [`Self::page_bbox`] there); `extract_words` / text lines lay their
+    /// glyphs out along that physical box. [`Self::page_bbox`] returns
+    /// `bbox` unchanged when this is set. Runtime metadata — deliberately not
+    /// serialized.
     #[serde(skip)]
     pub turned_bbox: bool,
     /// Provenance of this span's Unicode text — which ISO 32000-1 §9.10.2

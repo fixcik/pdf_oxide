@@ -12884,10 +12884,9 @@ impl PdfDocument {
     /// Box runs whose text matrix turns them upright against the page
     /// `/Rotate` (non-mirrored, content angle ≡ `rot` mod 360, `rot` ≠ 0) by
     /// their physical hull ([`TextSpan::page_bbox`](crate::layout::TextSpan::page_bbox))
-    /// instead of the along-x extents, and mark them `turned_bbox`. Such a run
-    /// reads horizontally on the displayed page, so after the `/Rotate`
-    /// mapping of span postprocessing its box is again wide along the writing
-    /// axis. All other runs are left alone.
+    /// instead of the along-x extents, and mark them `turned_bbox` (raw user
+    /// space; such a run reads horizontally on the displayed page). All other
+    /// runs are left alone.
     fn turn_upright_run_boxes(spans: &mut [crate::layout::TextSpan], rot: i32) {
         let rot = rot.rem_euclid(360);
         if !matches!(rot, 90 | 180 | 270) {
@@ -12902,6 +12901,26 @@ impl PdfDocument {
                 s.turned_bbox = true;
             }
         }
+    }
+
+    /// A displayed-frame span (already mapped through the page `/Rotate`) of
+    /// a run turned upright against that rotation, re-boxed by its physical
+    /// hull so its glyphs lay out along x like any horizontal run (words and
+    /// text lines); `None` for every other span.
+    fn upright_in_displayed_frame(s: &crate::layout::TextSpan) -> Option<crate::layout::TextSpan> {
+        let rot = s.page_rotation_applied.rem_euclid(360);
+        if s.mirrored
+            || s.turned_bbox
+            || !matches!(rot, 90 | 180 | 270)
+            || (s.rotation_degrees.rem_euclid(360.0) - rot as f32).abs() >= 0.5
+        {
+            return None;
+        }
+        let mut t = s.clone();
+        t.bbox = s.page_bbox();
+        t.char_x_offsets.clear();
+        t.turned_bbox = true;
+        Some(t)
     }
 
     /// Map a single span's bbox into the displayed frame for a `/Rotate`d page
@@ -17488,11 +17507,7 @@ impl PdfDocument {
             }
         }
 
-        let mut spans = extractor.extract_text_spans(&content_data)?;
-        if spans.iter().any(|s| s.rotation_degrees != 0.0) {
-            let rot = self.get_page_rotation(page_index).unwrap_or(0);
-            Self::turn_upright_run_boxes(&mut spans, rot);
-        }
+        let spans = extractor.extract_text_spans(&content_data)?;
         if visibility_facts {
             let paints = extractor.take_paint_events();
             self.raw_paints
@@ -17826,6 +17841,12 @@ impl PdfDocument {
         // Apply struct-tree-scope /ActualText (ISO 32000-1 §14.9.4).
         self.apply_actualtext_to_spans(page_index, &mut spans);
 
+        // Raw user space: runs turned upright against the page /Rotate are
+        // boxed where their glyphs are (see `turn_upright_run_boxes`).
+        if spans.iter().any(|s| s.rotation_degrees != 0.0) {
+            let rot = self.get_page_rotation(page_index).unwrap_or(0);
+            Self::turn_upright_run_boxes(&mut spans, rot);
+        }
         Ok(spans)
     }
 
@@ -18120,12 +18141,7 @@ impl PdfDocument {
         }
 
         // Extract text spans
-        let mut spans = extractor.extract_text_spans(&content_data)?;
-        if spans.iter().any(|s| s.rotation_degrees != 0.0) {
-            let rot = self.get_page_rotation(page_index).unwrap_or(0);
-            Self::turn_upright_run_boxes(&mut spans, rot);
-        }
-        Ok(spans)
+        extractor.extract_text_spans(&content_data)
     }
 
     /// Extract individual characters from a PDF page.
@@ -18742,7 +18758,10 @@ impl PdfDocument {
         let mut span_char_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
         for s in spans.iter() {
             let start = all_chars.len();
-            all_chars.extend(s.to_chars());
+            match Self::upright_in_displayed_frame(s) {
+                Some(t) => all_chars.extend(t.to_chars()),
+                None => all_chars.extend(s.to_chars()),
+            }
             span_char_ranges.push(start..all_chars.len());
         }
         if all_chars.is_empty() {
@@ -19110,7 +19129,10 @@ impl PdfDocument {
         let mut span_char_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
         for s in spans.iter() {
             let start = all_chars.len();
-            all_chars.extend(s.to_chars());
+            match Self::upright_in_displayed_frame(s) {
+                Some(t) => all_chars.extend(t.to_chars()),
+                None => all_chars.extend(s.to_chars()),
+            }
             span_char_ranges.push(start..all_chars.len());
         }
         let props =

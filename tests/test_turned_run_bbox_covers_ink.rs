@@ -1,9 +1,10 @@
 //! A run whose text matrix turns it upright against the page `/Rotate`
 //! (`0 1 -1 0 Tm` under `/Rotate 90`, `0 -1 1 0 Tm` under `/Rotate 270`) reads
 //! as horizontal text on the displayed page. Its span box must cover the ink
-//! the renderer draws for it, both in raw user space (`extract_structured`)
-//! and in the displayed frame (`extract_spans`), instead of a box laid along
-//! the raw x axis from the run origin.
+//! the renderer draws for it in raw user space (`extract_structured`), and
+//! its words in the displayed frame (`extract_words`), instead of a box laid
+//! along the raw x axis from the run origin. `extract_spans` keeps its mapped
+//! box; its `page_bbox()` is the physical one.
 
 #![cfg(feature = "rendering")]
 
@@ -115,7 +116,8 @@ fn check(rotate: i32, tm: &str) {
     assert_covers(to_display(raw[0].bbox, rotate), ink, "extract_structured (raw frame)");
     let shown = doc.extract_spans(0).unwrap();
     assert_eq!(shown.len(), 1);
-    assert_covers(shown[0].bbox, ink, "extract_spans (displayed frame)");
+    assert!(!shown[0].turned_bbox);
+    assert_covers(shown[0].page_bbox(), ink, "extract_spans page_bbox (displayed frame)");
     let words = doc.extract_words(0).unwrap();
     let union = words
         .iter()
