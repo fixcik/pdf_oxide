@@ -105,9 +105,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: All entries should be accessible
@@ -205,9 +203,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Range lookups work (binary search should find correct range)
@@ -340,9 +336,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify bfchar sections work
@@ -435,9 +429,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Covered code resolves via /ToUnicode.
@@ -545,9 +537,7 @@ end
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
             cjk_substitution: None,
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
         };
 
         // Both formats should parse identically
@@ -656,9 +646,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Large CMap parsing works (lazy loading should handle all 10k entries)
@@ -758,9 +746,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Lazy loading should handle mega-CMaps efficiently

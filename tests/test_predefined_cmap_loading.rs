@@ -113,9 +113,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Predefined CMap mappings work
@@ -212,9 +210,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: CNS1 mappings work
@@ -312,9 +308,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Hiragana characters
@@ -412,9 +406,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Hangul syllables
@@ -513,9 +505,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     let font2 = FontInfo {
@@ -560,9 +550,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Both fonts should access the same CMap
@@ -659,9 +647,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Vertical writing support
@@ -752,9 +738,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Supplement 2 extended characters
@@ -853,9 +837,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Text extraction works even without custom ToUnicode

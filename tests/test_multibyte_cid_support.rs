@@ -96,9 +96,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Single-byte codes still work
@@ -200,9 +198,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Range 1 (0x0001-0x000F → 0x4E00-0x4E0E)
@@ -306,9 +302,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Typical GB1 characters
@@ -392,9 +386,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Range 1 (Traditional Chinese characters)
@@ -483,9 +475,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Hiragana range
@@ -589,9 +579,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: ASCII range (0x0020-0x007E)
@@ -681,9 +669,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Large CID values

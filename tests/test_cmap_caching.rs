@@ -99,9 +99,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     let font2 = FontInfo {
@@ -142,9 +140,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // First font: triggers cache population (parse CMap)
@@ -256,9 +252,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     let font_b = FontInfo {
@@ -299,9 +293,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Font A should map 0x0001 to 'a'
@@ -399,9 +391,7 @@ end
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
             cjk_substitution: None,
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
         })
         .collect();
 
@@ -500,9 +490,7 @@ end
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
             cjk_substitution: None,
-            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            type0_unicode_memo: Default::default(),
         })
         .collect();
 
@@ -590,9 +578,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Font should work correctly (cache metrics are internal)
@@ -682,9 +668,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     });
 
     let mut handles = vec![];

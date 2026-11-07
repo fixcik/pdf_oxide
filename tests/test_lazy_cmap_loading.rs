@@ -95,9 +95,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Character lookup should still work (lazy parsing on first access)
@@ -183,9 +181,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify same result from sequential calls
@@ -279,9 +275,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: All entries should be accessible
@@ -383,9 +377,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Multiple lookups should all hit the cache
@@ -474,9 +466,7 @@ end
         cid_vertical_metrics: None,
         cid_default_vertical_metrics: pdf_oxide::fonts::VerticalMetrics::SPEC_DEFAULT,
         cjk_substitution: None,
-        type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        type0_unicode_memo: Default::default(),
     };
 
     // Verify: Explicit mappings work
