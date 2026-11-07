@@ -18,7 +18,9 @@ pub struct PathContent {
     pub operations: Vec<PathOperation>,
     /// Stroke color (None for no stroke)
     pub stroke_color: Option<Color>,
-    /// Fill color (None for no fill)
+    /// Fill color: `None` for paths that are not filled (or before any colour
+    /// operator). Colours that cannot be mapped to RGB (Pattern, Separation,
+    /// DeviceN, Indexed, Lab) leave the previous colour in place.
     pub fill_color: Option<Color>,
     /// Stroke width in points
     pub stroke_width: f32,

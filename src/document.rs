@@ -19552,7 +19552,7 @@ impl PdfDocument {
     /// Resolve a colour-space operand of `cs`/`CS` to the kind path extraction
     /// can map to RGB. Only Device*, Cal* and ICCBased (by `/N`) are mapped;
     /// Pattern, Separation, DeviceN, Indexed, Lab and unresolvable names are
-    /// `Unknown` (no colour) rather than a plausible-but-wrong one.
+    /// `Unknown`, for which `sc`/`scn` leave the current colour untouched.
     fn resolve_path_color_space(
         &self,
         name: &str,
@@ -19562,17 +19562,18 @@ impl PdfDocument {
         let by_family = |family: &str, n: Option<i64>| match (family, n) {
             ("DeviceGray" | "CalGray", _) | ("ICCBased", Some(1)) => Cs::Gray,
             ("DeviceRGB" | "CalRGB", _) | ("ICCBased", Some(3)) => Cs::Rgb,
-            ("DeviceCMYK", _) | ("ICCBased", Some(4)) => Cs::Cmyk,
+            ("DeviceCMYK", _) => Cs::Cmyk,
+            ("ICCBased", Some(4)) => Cs::IccCmyk,
             _ => Cs::Unknown,
         };
         if name.starts_with("Device") {
             return by_family(name, None);
         }
         let lookup = || -> Option<Cs> {
-            let res = self.resolve_object(resources?).ok()?;
-            let spaces = self
-                .resolve_object(res.as_dict()?.get("ColorSpace")?)
-                .ok()?;
+            // The scope's resources are already resolved; only the
+            // /ColorSpace entry and the space itself may be references.
+            let spaces = resources?.as_dict()?.get("ColorSpace")?;
+            let spaces = self.resolve_object(spaces).ok()?;
             let entry = self.resolve_object(spaces.as_dict()?.get(name)?).ok()?;
             if let Some(family) = entry.as_name() {
                 return Some(by_family(family, None));
@@ -19589,13 +19590,15 @@ impl PdfDocument {
             Some(by_family(family, n))
         };
         lookup().unwrap_or_else(|| {
-            log::debug!("path colour space {:?} not resolvable; colour unknown", name);
+            log::debug!("path colour space {:?} not resolvable; colour unchanged", name);
             Cs::Unknown
         })
     }
 
     /// Apply `cs`/`CS`/`sc`/`SC`/`scn`/`SCN` to the path graphics state and
-    /// extractor (ISO 32000-1:2008 §8.6.8).
+    /// extractor (ISO 32000-1:2008 §8.6.8). A space that cannot be mapped to
+    /// RGB (Pattern, tint and index spaces, mismatched component counts)
+    /// leaves the current colour exactly as it was.
     fn apply_path_color_op(
         &self,
         op: crate::content::Operator,
@@ -19613,24 +19616,34 @@ impl PdfDocument {
                 let fill = matches!(op, Operator::SetFillColorSpace { .. });
                 let space = if name == "Pattern" {
                     Cs::Unknown
+                } else if let Some(cached) = extractor.cached_color_space(name) {
+                    cached
                 } else {
-                    self.resolve_path_color_space(name, extractor.current_resources())
+                    let resolved =
+                        self.resolve_path_color_space(name, extractor.current_resources());
+                    extractor.cache_color_space(name, resolved);
+                    resolved
                 };
-                // §8.6.8: selecting a space resets the colour to its initial
-                // value, which is black for every space mapped here.
                 let st = state_stack.current_mut();
                 if fill {
                     st.fill_space = space;
-                    st.fill_color_rgb = (0.0, 0.0, 0.0);
                 } else {
                     st.stroke_space = space;
-                    st.stroke_color_rgb = (0.0, 0.0, 0.0);
                 }
-                match (fill, space) {
-                    (true, Cs::Unknown) => extractor.clear_fill_color(),
-                    (false, Cs::Unknown) => extractor.clear_stroke_color(),
-                    (true, _) => extractor.set_fill_color(Color::black()),
-                    (false, _) => extractor.set_stroke_color(Color::black()),
+                // §8.6.8: selecting a space resets the colour to its initial
+                // value. Known only for mapped spaces; otherwise unchanged.
+                let initial = match space {
+                    Cs::Gray | Cs::Rgb | Cs::Cmyk => (0.0, 0.0, 0.0),
+                    Cs::IccCmyk => (1.0, 1.0, 1.0),
+                    Cs::Unknown => return,
+                };
+                let color = Color::new(initial.0, initial.1, initial.2);
+                if fill {
+                    st.fill_color_rgb = initial;
+                    extractor.set_fill_color(color);
+                } else {
+                    st.stroke_color_rgb = initial;
+                    extractor.set_stroke_color(color);
                 }
                 return;
             },
@@ -19643,23 +19656,13 @@ impl PdfDocument {
         let st = state_stack.current_mut();
         let space = if fill { st.fill_space } else { st.stroke_space };
         let rgb = if pattern { None } else { space.to_rgb(&comps) };
-        match (fill, rgb) {
-            (true, Some((r, g, b))) => {
-                st.fill_color_rgb = (r, g, b);
-                extractor.set_fill_color(Color::new(r, g, b));
-            },
-            (false, Some((r, g, b))) => {
-                st.stroke_color_rgb = (r, g, b);
-                extractor.set_stroke_color(Color::new(r, g, b));
-            },
-            (true, None) => {
-                st.fill_space = Cs::Unknown;
-                extractor.clear_fill_color();
-            },
-            (false, None) => {
-                st.stroke_space = Cs::Unknown;
-                extractor.clear_stroke_color();
-            },
+        let Some((r, g, b)) = rgb else { return };
+        if fill {
+            st.fill_color_rgb = (r, g, b);
+            extractor.set_fill_color(Color::new(r, g, b));
+        } else {
+            st.stroke_color_rgb = (r, g, b);
+            extractor.set_stroke_color(Color::new(r, g, b));
         }
     }
 
