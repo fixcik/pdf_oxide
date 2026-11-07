@@ -9179,7 +9179,16 @@ impl PdfDocument {
 
         // Collect (base_idx, sub_idx, sub_text, sub_right_edge, sub_char_widths, sub_fs)
         // before mutating spans.
-        let ops: Vec<(usize, usize, String, f32, Vec<f32>, f32)> = to_merge
+        type MergeOp = (
+            usize,
+            usize,
+            String,
+            f32,
+            Vec<f32>,
+            f32,
+            Option<crate::extractors::visibility::SpanVisibility>,
+        );
+        let ops: Vec<MergeOp> = to_merge
             .iter()
             .map(|pair| {
                 let (bi, si) = *pair;
@@ -9191,6 +9200,7 @@ impl PdfDocument {
                     sub.bbox.x + sub.bbox.width,
                     sub.char_widths.clone(),
                     sub.font_size,
+                    sub.visibility,
                 )
             })
             .collect();
@@ -9204,8 +9214,9 @@ impl PdfDocument {
         // After merging sub text, char_count grows but cw_len stays the same, which would
         // cause the split to re-separate the merged token (e.g. "k1" → "k 1"). Adding
         // estimated widths for the sub characters prevents this.
-        for (base_idx, _, sub_text, sub_right, sub_cw, sub_fs) in &ops {
+        for (base_idx, _, sub_text, sub_right, sub_cw, sub_fs, sub_vis) in &ops {
             let base = &mut spans[*base_idx];
+            crate::extractors::visibility::merge_glyph_facts(&mut base.visibility, sub_vis);
             base.text.push_str(sub_text);
             let base_right = base.bbox.x + base.bbox.width;
             if *sub_right > base_right {
@@ -9227,7 +9238,7 @@ impl PdfDocument {
 
         // Drop the merged sub/superscript spans in one pass.
         let to_remove: std::collections::HashSet<usize> =
-            ops.iter().map(|(_, si, _, _, _, _)| *si).collect();
+            ops.iter().map(|(_, si, ..)| *si).collect();
         let mut idx = 0usize;
         spans.retain(|_| {
             let keep = !to_remove.contains(&idx);
@@ -15273,6 +15284,7 @@ impl PdfDocument {
                 merged.text.push(' ');
             }
             merged.text.push_str(&s.text);
+            crate::extractors::visibility::merge_glyph_facts(&mut merged.visibility, &s.visibility);
             x_max = x_max.max(s.bbox.x + s.bbox.width);
             merged.bbox.y = merged.bbox.y.min(s.bbox.y);
         }

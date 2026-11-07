@@ -50,6 +50,8 @@ pub use structured::{
 };
 pub use synthetic_structure::{SyntheticStructureConfig, SyntheticStructureGenerator};
 pub use text::{SpanMergingConfig, TextExtractionConfig, TextExtractor};
-pub use visibility::{ClipKind, PageVisibility, PaintEvent, PaintKind, SpanVisibility};
+pub use visibility::{
+    BlendMode, ClipKind, PageVisibility, PaintEvent, PaintKind, SpanVisibility, TINY_GLYPH_PT,
+};
 pub use warnings::{Warning, WarningCategory, WarningSink};
 pub use xmp::{XmpExtractor, XmpMetadata};

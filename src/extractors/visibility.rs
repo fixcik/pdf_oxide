@@ -17,11 +17,12 @@
 //! control-point hull), with [`ClipKind`] telling whether that bbox is exact;
 //! a Form XObject without text is reported as one opaque
 //! [`PaintKind::Form`] event instead of being walked; strokes are not
-//! recorded. Fill colours: Separation `/All` maps to gray `1 - tint` and
-//! `/Black` plus DeviceN of process colorants map straight to CMYK; other
-//! Separation/DeviceN spaces are evaluated only through Type 2 and Type 4 tint
-//! transforms (Type 0/3 give `None`); an `Indexed` base must be Device*, Cal*
-//! or ICCBased.
+//! recorded. Per-glyph size facts (`SpanVisibility::tiny_glyphs` …) are
+//! collected per show-text run and folded when spans merge. Fill colours:
+//! Separation `/All` maps to gray `1 - tint` and `/Black` plus DeviceN of
+//! process colorants map straight to CMYK; other Separation/DeviceN spaces
+//! are evaluated only through Type 2 and Type 4 tint transforms (Type 0/3
+//! give `None`); an `Indexed` base must be Device*, Cal* or ICCBased.
 
 use crate::geometry::Rect;
 use crate::layout::Color;
@@ -65,6 +66,145 @@ pub struct SpanVisibility {
     /// merging ignores this field, so a merged span keeps its first run's
     /// value.
     pub fill_color: Option<Color>,
+    /// ExtGState blend mode (`/BM`, ISO 32000-1 §11.3.5) in effect;
+    /// `blend_non_normal == (blend_mode != BlendMode::Normal)`.
+    pub blend_mode: BlendMode,
+    /// Smallest device-space font size (`Tfs` × vertical scale of
+    /// `CTM × Tm`, the span's `font_size`) among the runs merged into this
+    /// span; equals `font_size` for an unmerged span.
+    pub glyph_size_min: f32,
+    /// Largest own advance of a non-whitespace glyph in user space: the
+    /// glyph width `w0 × Tfs × Th` under `CTM × Tm`, **without** `Tc`/`Tw`
+    /// and TJ adjustments, so letter spacing cannot make a tiny glyph look
+    /// wide. `None` when no per-glyph widths were seen (e.g. an
+    /// `/ActualText` replacement, or a span with only whitespace).
+    pub glyph_advance_max: Option<f32>,
+    /// Non-whitespace glyphs that are tiny on both axes: device font size
+    /// `<= TINY_GLYPH_PT` and own advance (as in `glyph_advance_max`)
+    /// `<= TINY_GLYPH_PT`. Summed over merged runs, so `0 < tiny_glyphs`
+    /// on a span whose bbox is not tiny flags a tiny run merged into it or a
+    /// letter-spaced tiny run. Approximate where one code maps to several
+    /// characters (the code's width is split evenly). A span later split
+    /// into pieces (fused-word / camel-case splits) keeps the whole run's
+    /// per-glyph values on every piece, so the count is then an upper bound
+    /// per piece. Under the non-default `WordBoundaryMode::Primary` TJ path
+    /// the glyph advances come from the span's `char_widths` and include
+    /// `Tc`.
+    pub tiny_glyphs: u32,
+}
+
+/// Size threshold (in PDF points, both axes) behind
+/// [`SpanVisibility::tiny_glyphs`].
+pub const TINY_GLYPH_PT: f32 = 1.0;
+
+/// ExtGState blend mode (`/BM`, ISO 32000-1 §11.3.5, Tables 136–137). For an
+/// array value the first entry is taken. `Compatible` maps to `Normal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[non_exhaustive]
+pub enum BlendMode {
+    /// `Normal` / `Compatible`, or no `/BM` set.
+    #[default]
+    Normal,
+    /// `/Multiply`.
+    Multiply,
+    /// `/Screen`.
+    Screen,
+    /// `/Overlay`.
+    Overlay,
+    /// `/Darken`.
+    Darken,
+    /// `/Lighten`.
+    Lighten,
+    /// `/ColorDodge`.
+    ColorDodge,
+    /// `/ColorBurn`.
+    ColorBurn,
+    /// `/HardLight`.
+    HardLight,
+    /// `/SoftLight`.
+    SoftLight,
+    /// `/Difference`.
+    Difference,
+    /// `/Exclusion`.
+    Exclusion,
+    /// `/Hue`.
+    Hue,
+    /// `/Saturation`.
+    Saturation,
+    /// `/Color`.
+    Color,
+    /// `/Luminosity`.
+    Luminosity,
+    /// Any other name (or a non-name entry): not `Normal`, effect unknown.
+    Other,
+}
+
+impl BlendMode {
+    /// Blend mode of a `/BM` value (a name or an array of names).
+    pub(crate) fn from_object(bm: &Object) -> Self {
+        let first = match bm {
+            Object::Array(a) => a.first().and_then(|o| o.as_name()),
+            other => other.as_name(),
+        };
+        match first {
+            None => BlendMode::Normal,
+            Some("Normal") | Some("Compatible") => BlendMode::Normal,
+            Some("Multiply") => BlendMode::Multiply,
+            Some("Screen") => BlendMode::Screen,
+            Some("Overlay") => BlendMode::Overlay,
+            Some("Darken") => BlendMode::Darken,
+            Some("Lighten") => BlendMode::Lighten,
+            Some("ColorDodge") => BlendMode::ColorDodge,
+            Some("ColorBurn") => BlendMode::ColorBurn,
+            Some("HardLight") => BlendMode::HardLight,
+            Some("SoftLight") => BlendMode::SoftLight,
+            Some("Difference") => BlendMode::Difference,
+            Some("Exclusion") => BlendMode::Exclusion,
+            Some("Hue") => BlendMode::Hue,
+            Some("Saturation") => BlendMode::Saturation,
+            Some("Color") => BlendMode::Color,
+            Some("Luminosity") => BlendMode::Luminosity,
+            Some(_) => BlendMode::Other,
+        }
+    }
+}
+
+/// Per-glyph size statistics of one text run (collected only with facts on).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GlyphStats {
+    /// Largest own advance of a non-whitespace glyph (user space).
+    pub(crate) advance_max: Option<f32>,
+    /// Glyphs tiny on both axes (see [`SpanVisibility::tiny_glyphs`]).
+    pub(crate) tiny: u32,
+}
+
+impl GlyphStats {
+    /// Record one non-whitespace glyph of device font size `size` and own
+    /// advance `advance` (user space).
+    pub(crate) fn note(&mut self, size: f32, advance: f32) {
+        let advance = if advance.is_finite() {
+            advance.abs()
+        } else {
+            return;
+        };
+        self.advance_max = Some(self.advance_max.map_or(advance, |m| m.max(advance)));
+        if size.abs() <= TINY_GLYPH_PT && advance <= TINY_GLYPH_PT {
+            self.tiny = self.tiny.saturating_add(1);
+        }
+    }
+}
+
+/// Fold the per-glyph facts of `other` into `into` when two spans merge
+/// (the other facts keep `into`'s first-run values).
+pub(crate) fn merge_glyph_facts(into: &mut Option<SpanVisibility>, other: &Option<SpanVisibility>) {
+    if let (Some(a), Some(b)) = (into.as_mut(), other) {
+        a.glyph_size_min = a.glyph_size_min.min(b.glyph_size_min);
+        a.glyph_advance_max = match (a.glyph_advance_max, b.glyph_advance_max) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, y) => x.or(y),
+        };
+        a.tiny_glyphs = a.tiny_glyphs.saturating_add(b.tiny_glyphs);
+    }
 }
 
 /// Shape class of the clip in effect (the clip bbox is always tracked; this
@@ -137,6 +277,10 @@ pub struct PaintEvent {
     /// Kind of clip in effect when the paint was recorded (for `re W f` the
     /// clip before the new one).
     pub clip_kind: ClipKind,
+    /// ExtGState blend mode (`/BM`) the paint was drawn with. Under a
+    /// non-`Normal` mode (e.g. a `Multiply` highlight) the paint's colour
+    /// does not simply cover what is below it.
+    pub blend_mode: BlendMode,
 }
 
 /// Page-level visibility facts.
@@ -175,7 +319,7 @@ struct VisState {
     fill_alpha: f32,
     stroke_alpha: f32,
     soft_mask: bool,
-    blend_non_normal: bool,
+    blend_mode: BlendMode,
     fill: Fill,
 }
 
@@ -572,7 +716,7 @@ impl Default for VisState {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             soft_mask: false,
-            blend_non_normal: false,
+            blend_mode: BlendMode::Normal,
             fill: Fill::Device,
         }
     }
@@ -695,8 +839,8 @@ impl VisibilityTracker {
         self.current.soft_mask = on;
     }
 
-    pub(crate) fn set_blend_non_normal(&mut self, on: bool) {
-        self.current.blend_non_normal = on;
+    pub(crate) fn set_blend_mode(&mut self, mode: BlendMode) {
+        self.current.blend_mode = mode;
     }
 
     /// Intersect the current clip with `rect`'s points mapped through `ctm`.
@@ -859,6 +1003,7 @@ impl VisibilityTracker {
             masked,
             paint_order,
             clip_kind: self.current.clip_kind,
+            blend_mode: self.current.blend_mode,
         });
     }
 
@@ -868,13 +1013,16 @@ impl VisibilityTracker {
         o
     }
 
-    /// Facts for a span just emitted with `bbox` under `render_mode` and
-    /// device fill colour `color`.
+    /// Facts for a span just emitted with `bbox` under `render_mode`, device
+    /// fill colour `color`, device font size `font_size` and per-glyph
+    /// statistics `glyphs`.
     pub(crate) fn span_facts(
         &mut self,
         render_mode: u8,
         bbox: &Rect,
         color: Color,
+        font_size: f32,
+        glyphs: GlyphStats,
     ) -> SpanVisibility {
         let clip_coverage = match self.current.clip {
             None => 1.0,
@@ -885,11 +1033,15 @@ impl VisibilityTracker {
             fill_alpha: self.current.fill_alpha,
             stroke_alpha: self.current.stroke_alpha,
             soft_mask: self.current.soft_mask,
-            blend_non_normal: self.current.blend_non_normal,
+            blend_non_normal: self.current.blend_mode != BlendMode::Normal,
             clip_coverage,
             paint_order: self.next_order(),
             clip_kind: self.current.clip_kind,
             fill_color: self.current.fill.color(Some(color)),
+            blend_mode: self.current.blend_mode,
+            glyph_size_min: font_size,
+            glyph_advance_max: glyphs.advance_max,
+            tiny_glyphs: glyphs.tiny,
         }
     }
 }
@@ -1032,7 +1184,13 @@ mod tests {
         t.path_segment(true);
         t.mark_clip(false, true);
         t.end_path(false, false, None);
-        let v = t.span_facts(0, &Rect::new(0.0, 0.0, 50.0, 12.0), Color::black());
+        let v = t.span_facts(
+            0,
+            &Rect::new(0.0, 0.0, 50.0, 12.0),
+            Color::black(),
+            12.0,
+            GlyphStats::default(),
+        );
         assert_eq!(v.clip_coverage, 0.0);
     }
 
@@ -1041,10 +1199,28 @@ mod tests {
         let mut t = VisibilityTracker::default();
         t.save();
         t.clip_to(&Matrix::identity(), 0.0, 0.0, 10.0, 10.0);
-        let inside = t.span_facts(0, &Rect::new(0.0, 0.0, 5.0, 5.0), Color::black());
-        let half = t.span_facts(0, &Rect::new(5.0, 0.0, 10.0, 5.0), Color::black());
+        let inside = t.span_facts(
+            0,
+            &Rect::new(0.0, 0.0, 5.0, 5.0),
+            Color::black(),
+            12.0,
+            GlyphStats::default(),
+        );
+        let half = t.span_facts(
+            0,
+            &Rect::new(5.0, 0.0, 10.0, 5.0),
+            Color::black(),
+            12.0,
+            GlyphStats::default(),
+        );
         t.restore();
-        let after = t.span_facts(0, &Rect::new(500.0, 500.0, 5.0, 5.0), Color::black());
+        let after = t.span_facts(
+            0,
+            &Rect::new(500.0, 500.0, 5.0, 5.0),
+            Color::black(),
+            12.0,
+            GlyphStats::default(),
+        );
         assert_eq!(inside.clip_coverage, 1.0);
         assert!((half.clip_coverage - 0.5).abs() < 1e-6);
         assert_eq!(after.clip_coverage, 1.0);
@@ -1146,10 +1322,18 @@ mod tests {
     fn clip_kind_nested_q_restores_and_takes_max() {
         let mut t = VisibilityTracker::default();
         let bbox = Rect::new(0.0, 0.0, 1.0, 1.0);
-        assert_eq!(t.span_facts(0, &bbox, Color::black()).clip_kind, ClipKind::None);
+        assert_eq!(
+            t.span_facts(0, &bbox, Color::black(), 12.0, GlyphStats::default())
+                .clip_kind,
+            ClipKind::None
+        );
         t.save();
         clip_rect(&mut t, true);
-        assert_eq!(t.span_facts(0, &bbox, Color::black()).clip_kind, ClipKind::Rect);
+        assert_eq!(
+            t.span_facts(0, &bbox, Color::black(), 12.0, GlyphStats::default())
+                .clip_kind,
+            ClipKind::Rect
+        );
         t.save();
         let m = Matrix::identity();
         for _ in 0..2 {
@@ -1159,11 +1343,23 @@ mod tests {
         }
         t.mark_clip(true, true);
         t.end_path(false, false, None);
-        assert_eq!(t.span_facts(0, &bbox, Color::black()).clip_kind, ClipKind::EvenOdd);
+        assert_eq!(
+            t.span_facts(0, &bbox, Color::black(), 12.0, GlyphStats::default())
+                .clip_kind,
+            ClipKind::EvenOdd
+        );
         t.restore();
-        assert_eq!(t.span_facts(0, &bbox, Color::black()).clip_kind, ClipKind::Rect);
+        assert_eq!(
+            t.span_facts(0, &bbox, Color::black(), 12.0, GlyphStats::default())
+                .clip_kind,
+            ClipKind::Rect
+        );
         t.restore();
-        assert_eq!(t.span_facts(0, &bbox, Color::black()).clip_kind, ClipKind::None);
+        assert_eq!(
+            t.span_facts(0, &bbox, Color::black(), 12.0, GlyphStats::default())
+                .clip_kind,
+            ClipKind::None
+        );
     }
 
     #[test]

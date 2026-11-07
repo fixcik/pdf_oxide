@@ -1939,6 +1939,8 @@ struct TjBuffer {
     /// producer would, so the geometric visual/logical detector's ascending-
     /// x signal is uninformative here (#826) — see `bidi::apply_rtl_verdict`.
     render_mode: u8,
+    /// Per-glyph size statistics; collected only with visibility facts on.
+    glyphs: crate::extractors::visibility::GlyphStats,
 }
 
 /// Snap a run's display rotation (from the composed `CTM × T_m` rotation block,
@@ -2063,12 +2065,30 @@ impl TjBuffer {
                 0.0
             },
             render_mode: state.render_mode,
+            glyphs: Default::default(),
         }
     }
 
     /// Check if the buffer is empty.
     fn is_empty(&self) -> bool {
         self.unicode.is_empty()
+    }
+
+    /// Record the glyphs appended since `(byte_from, width_from)` into
+    /// `glyphs` (visibility facts only). `char_space` is the `Tc` share of
+    /// each width (text space), removed so the own glyph advance remains.
+    fn note_glyphs(&mut self, byte_from: usize, width_from: usize, char_space: f32) {
+        let (Some(text), Some(widths)) =
+            (self.unicode.get(byte_from..), self.char_widths.get(width_from..))
+        else {
+            return;
+        };
+        for (c, w) in text.chars().zip(widths) {
+            if !c.is_whitespace() {
+                self.glyphs
+                    .note(self.effective_font_size, (w - char_space) * self.user_h_scale);
+            }
+        }
     }
 
     /// Append a text string to the buffer.
@@ -2515,10 +2535,30 @@ impl<'doc> TextExtractor<'doc> {
     }
 
     /// Append an emitted span, stamping its visibility facts when enabled.
-    fn push_span(&mut self, mut span: TextSpan) {
+    fn push_span(&mut self, span: TextSpan) {
+        self.push_span_with_glyphs(span, None);
+    }
+
+    /// [`Self::push_span`] with the run's per-glyph statistics; `None` takes
+    /// them from the span itself (its `char_widths`, `Tc` included).
+    fn push_span_with_glyphs(
+        &mut self,
+        mut span: TextSpan,
+        glyphs: Option<crate::extractors::visibility::GlyphStats>,
+    ) {
         if let Some(vis) = self.vis.as_mut() {
             let render_mode = self.state_stack.current().render_mode;
-            span.visibility = Some(vis.span_facts(render_mode, &span.bbox, span.color));
+            let glyphs = glyphs.unwrap_or_else(|| {
+                let mut g = crate::extractors::visibility::GlyphStats::default();
+                for (c, w) in span.text.chars().zip(&span.char_widths) {
+                    if !c.is_whitespace() {
+                        g.note(span.font_size, *w);
+                    }
+                }
+                g
+            });
+            span.visibility =
+                Some(vis.span_facts(render_mode, &span.bbox, span.color, span.font_size, glyphs));
         }
         self.spans.push(span);
     }
@@ -5161,6 +5201,12 @@ impl<'doc> TextExtractor<'doc> {
                 // A merged span is logical-draw RTL if any of its glyph runs was
                 // drawn right-to-left (see `detect_rtl_draw_direction`).
                 current.rtl_draw_logical |= span.rtl_draw_logical;
+                // Per-glyph size facts cover every merged run (no-op with
+                // facts off).
+                crate::extractors::visibility::merge_glyph_facts(
+                    &mut current.visibility,
+                    &span.visibility,
+                );
                 // Extend bounding box to include both spans
                 let new_width = (span.bbox.x + span.bbox.width) - current.bbox.x;
                 let new_height = current.bbox.height.max(span.bbox.height);
@@ -5727,20 +5773,16 @@ impl<'doc> TextExtractor<'doc> {
         let soft_mask = d
             .get("SMask")
             .map(|m| m.as_name() != Some("None") && !m.is_null());
-        let blend = d.get("BM").map(|bm| {
-            let first = match bm {
-                Object::Array(a) => a.first().and_then(|o| o.as_name()),
-                other => other.as_name(),
-            };
-            !matches!(first, None | Some("Normal") | Some("Compatible"))
-        });
+        let blend = d
+            .get("BM")
+            .map(crate::extractors::visibility::BlendMode::from_object);
         if let Some(v) = self.vis.as_mut() {
             v.set_alpha(fill, stroke);
             if let Some(m) = soft_mask {
                 v.set_soft_mask(m);
             }
             if let Some(b) = blend {
-                v.set_blend_non_normal(b);
+                v.set_blend_mode(b);
             }
         }
     }
@@ -7938,7 +7980,7 @@ impl<'doc> TextExtractor<'doc> {
         self.span_sequence_counter += 1;
 
         if !self.is_content_suppressed() {
-            self.push_span(span);
+            self.push_span_with_glyphs(span, Some(buffer.glyphs));
         }
         Ok(())
     }
@@ -8696,10 +8738,52 @@ impl<'doc> TextExtractor<'doc> {
         Ok(total_width)
     }
 
+    /// `Tc` share of one glyph width in text space (what the append paths
+    /// add per glyph): `Tc × Th` horizontally, `Tc` in vertical mode.
+    fn char_space_share(&self) -> f32 {
+        let state = self.state_stack.current();
+        if state.text_wmode == 0 {
+            state.char_space * state.horizontal_scaling / 100.0
+        } else {
+            state.char_space
+        }
+    }
+
+    /// [`Self::append_and_advance_impl`], recording per-glyph size facts
+    /// when visibility facts are on.
+    fn append_and_advance(&mut self, text: &[u8]) -> Result<()> {
+        if self.vis.is_none() {
+            return self.append_and_advance_impl(text);
+        }
+        let cs = self.char_space_share();
+        let mark = self
+            .tj_span_buffer
+            .as_ref()
+            .map(|b| (b.unicode.len(), b.char_widths.len()));
+        self.append_and_advance_impl(text)?;
+        if let (Some(b), Some((u, w))) = (self.tj_span_buffer.as_mut(), mark) {
+            b.note_glyphs(u, w, cs);
+        }
+        Ok(())
+    }
+
+    /// [`Self::append_advance_buffer_impl`], recording per-glyph size facts
+    /// when visibility facts are on.
+    fn append_advance_buffer(&mut self, buffer: &mut TjBuffer, text: &[u8]) -> Result<()> {
+        if self.vis.is_none() {
+            return self.append_advance_buffer_impl(buffer, text);
+        }
+        let cs = self.char_space_share();
+        let (u, w) = (buffer.unicode.len(), buffer.char_widths.len());
+        self.append_advance_buffer_impl(buffer, text)?;
+        buffer.note_glyphs(u, w, cs);
+        Ok(())
+    }
+
     /// Combined Unicode decode + width calculation in a single pass.
     /// Merges TjBuffer::append and advance_position_for_string for simple fonts,
     /// eliminating one full per-byte iteration per Tj operator.
-    fn append_and_advance(&mut self, text: &[u8]) -> Result<()> {
+    fn append_and_advance_impl(&mut self, text: &[u8]) -> Result<()> {
         let text = if text.len() > 32_767 {
             &text[..32_767]
         } else {
@@ -8908,7 +8992,7 @@ impl<'doc> TextExtractor<'doc> {
     /// Combined Unicode decode + width + position advance for a local buffer.
     /// Same as append_and_advance but works on an explicit buffer parameter
     /// instead of self.tj_span_buffer. Used by TJ array processing.
-    fn append_advance_buffer(&mut self, buffer: &mut TjBuffer, text: &[u8]) -> Result<()> {
+    fn append_advance_buffer_impl(&mut self, buffer: &mut TjBuffer, text: &[u8]) -> Result<()> {
         let text = if text.len() > 32_767 {
             &text[..32_767]
         } else {
@@ -9504,7 +9588,7 @@ impl<'doc> TextExtractor<'doc> {
                 );
 
                 if !self.is_content_suppressed() {
-                    self.push_span(span);
+                    self.push_span_with_glyphs(span, Some(buffer.glyphs));
                 }
             }
         }
