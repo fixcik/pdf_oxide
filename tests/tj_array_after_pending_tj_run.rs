@@ -78,6 +78,44 @@ fn space_drawn_after_tj_array_stays_after_it() {
     }
 }
 
+/// A raised citation drawn as `Tj` `TJ` `Tj` pieces after a body word:
+/// `(settings) Tj`, then at a smaller size and a raised baseline
+/// `(8,9,) Tj [(21)] TJ (,22) Tj`, then `(, and) Tj` back on the baseline.
+/// Each piece starts where the previous one ends.
+fn raised_citation_pdf() -> Vec<u8> {
+    let content = "BT /F1 10 Tf 1 0 0 1 100 700 Tm (settings) Tj\n\
+                   /F1 6 Tf 1 0 0 1 140 703 Tm (8,9,) Tj [(21)] TJ (,22) Tj\n\
+                   /F1 10 Tf 1 0 0 1 170 700 Tm (, and) Tj ET";
+    build_minimal_pdf(content.as_bytes())
+}
+
+#[test]
+fn raised_citation_pieces_stay_on_their_line_in_order() {
+    let doc = PdfDocument::from_bytes(raised_citation_pdf()).expect("open");
+    let spans = doc.extract_spans(0).expect("spans");
+    let base_y = spans
+        .iter()
+        .find(|s| s.text.contains("settings"))
+        .expect("base word")
+        .bbox
+        .y;
+    for s in &spans {
+        assert!(
+            (s.bbox.y - base_y).abs() < 1.0,
+            "span {:?} at y={} left the line at y={}",
+            s.text,
+            s.bbox.y,
+            base_y
+        );
+    }
+    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squeezed.contains("settings8,9,21,22,and"),
+        "citation pieces out of order: {text:?}"
+    );
+}
+
 fn build_minimal_pdf(content: &[u8]) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];

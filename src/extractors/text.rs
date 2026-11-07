@@ -3863,6 +3863,41 @@ impl<'doc> TextExtractor<'doc> {
                 self.spans[i].bbox.y = by;
             }
         }
+
+        // A raised citation run drawn as several consecutive show operations
+        // (`8,9,` `21` `,22`) has only its first piece next to the larger base
+        // span; the next piece sits next to that first piece, so the gate
+        // above never sees a base for it. Carry the snap to the piece drawn
+        // right after a snapped one when it continues it exactly: same font
+        // and size, same raised baseline, starting where the snapped piece
+        // ends, and made of digits, commas and a closing `]` only (formula
+        // pieces are not).
+        for i in 1..n {
+            let p = i - 1;
+            let (px, py, pw, pfs) = snapshot[p];
+            let (sx, sy, _sw, sfs) = snapshot[i];
+            if sfs <= 0.0 || self.spans[p].bbox.y == py || self.spans[i].bbox.y != sy {
+                continue;
+            }
+            let dx = sx - (px + pw);
+            let citation_piece = self.spans[i]
+                .text
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == ']' || c == ' ')
+                && self.spans[i]
+                    .text
+                    .chars()
+                    .any(|c| c.is_ascii_digit() || c == ']');
+            if citation_piece
+                && self.spans[i].font_name == self.spans[p].font_name
+                && (sfs - pfs).abs() < 0.01
+                && (sy - py).abs() < sfs * 0.1
+                && dx >= -sfs * 0.05
+                && dx < sfs * 0.3
+            {
+                self.spans[i].bbox.y = self.spans[p].bbox.y;
+            }
+        }
     }
 
     /// Sort extracted text spans by reading order (top-to-bottom, left-to-right).
