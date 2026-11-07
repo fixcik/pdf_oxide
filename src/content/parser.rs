@@ -158,7 +158,8 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
     Ok(operators)
 }
 
-/// Parse a content stream for path extraction, skipping BT/ET text blocks.
+/// Parse a content stream for path extraction, skipping BT/ET text blocks
+/// (apart from the colour operators inside them).
 ///
 /// This is a performance-optimized variant of [`parse_content_stream`] that:
 /// 1. Skips text object blocks (BT…ET) at the byte level
@@ -174,6 +175,12 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
 /// `Object::Real` for each numeric operand. Common operators like `m`, `l`, `c`,
 /// `re`, `cm`, `rg` are parsed entirely from raw bytes.
 pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
+    parse_paths_only(data, false)
+}
+
+/// `in_text` is set when `data` is the body of a BT…ET block: nested BT is then
+/// ignored instead of recursing.
+fn parse_paths_only(data: &[u8], in_text: bool) -> Result<Vec<Operator>> {
     let estimated_capacity = data.len() / 20;
     let mut operators = Vec::with_capacity(estimated_capacity.min(100_000));
     let len = data.len();
@@ -304,9 +311,26 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                 let operands = &data[operand_start..op_start];
 
                 // Skip BT/ET text blocks
-                if op == b"BT" {
+                if op == b"BT" && !in_text {
                     match scan_to_et(&data[i..]) {
                         Some(rest) => {
+                            // `cs`/`sc`/`scn` (and stroke twins) inside a text object
+                            // still change the graphics state (BT/ET do not
+                            // save/restore it), so keep those and drop the rest.
+                            let text = &data[i..len - rest.len()];
+                            if let Ok(inner) = parse_paths_only(text, true) {
+                                operators.extend(inner.into_iter().filter(|o| {
+                                    matches!(
+                                        o,
+                                        Operator::SetFillColorSpace { .. }
+                                            | Operator::SetStrokeColorSpace { .. }
+                                            | Operator::SetFillColor { .. }
+                                            | Operator::SetStrokeColor { .. }
+                                            | Operator::SetFillColorN { .. }
+                                            | Operator::SetStrokeColorN { .. }
+                                    )
+                                }));
+                            }
                             i = len - rest.len();
                             operand_start = i;
                         },
@@ -352,6 +376,11 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                         b"B*" => Some(Operator::FillStrokeEvenOdd),
                         b"b*" => Some(Operator::CloseFillStrokeEvenOdd),
                         b"W*" => Some(Operator::ClipEvenOdd),
+                        // Only reached for the body of a text block (see above).
+                        b"BT" => {
+                            operand_start = i;
+                            continue;
+                        },
                         // Skip text/shading operators that don't affect paths
                         b"ET" | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tf" | b"Tr" | b"Ts" | b"Td"
                         | b"TD" | b"Tm" | b"Tj" | b"TJ" | b"T*" | b"ri" | b"sh" | b"EI" => {

@@ -22,7 +22,9 @@ fn fixture_pdf() -> Vec<u8> {
 /DeviceRGB cs 0 1 0 sc 100 0 10 10 re f\n\
 /CS0 CS 1 0 0 SCN 120 0 10 10 re S\n\
 0 0 1 rg q /CS0 cs 1 1 1 scn Q 140 0 10 10 re f\n\
-/Pattern cs /P0 scn 0 1 0 rg 160 0 10 10 re f\n";
+/Pattern cs /P0 scn 0 1 0 rg 160 0 10 10 re f\n\
+BT /F1 9 Tf 0 0 Td /CS0 cs 1 1 1 scn (x) Tj ET 180 0 10 10 re f\n\
+BT /DeviceRGB cs 1 0 0 sc (x) Tj ET 200 0 10 10 re f\n";
     let objs: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
@@ -82,7 +84,7 @@ fn rgb(c: Option<Color>) -> Option<(f32, f32, f32)> {
 fn scn_sc_set_path_fill_colour_by_space_kind() {
     let doc = PdfDocument::from_bytes(fixture_pdf()).expect("parse fixture");
     let paths = doc.extract_paths(0).expect("extract paths");
-    assert_eq!(paths.len(), 9);
+    assert_eq!(paths.len(), 11);
 
     // ICCBased N=3 + scn -> white.
     assert_eq!(rgb(path_at(&paths, 0.0).fill_color), Some((1.0, 1.0, 1.0)));
@@ -103,4 +105,8 @@ fn scn_sc_set_path_fill_colour_by_space_kind() {
     assert_eq!(rgb(path_at(&paths, 140.0).fill_color), Some((0.0, 0.0, 1.0)));
     // A later device colour replaces an unknown (pattern) one.
     assert_eq!(rgb(path_at(&paths, 160.0).fill_color), Some((0.0, 1.0, 0.0)));
+
+    // A colour set inside a BT..ET block outlives the block.
+    assert_eq!(rgb(path_at(&paths, 180.0).fill_color), Some((1.0, 1.0, 1.0)));
+    assert_eq!(rgb(path_at(&paths, 200.0).fill_color), Some((1.0, 0.0, 0.0)));
 }
