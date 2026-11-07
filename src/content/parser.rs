@@ -158,7 +158,8 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
     Ok(operators)
 }
 
-/// Parse a content stream for path extraction, skipping BT/ET text blocks.
+/// Parse a content stream for path extraction, skipping BT/ET text blocks
+/// (apart from the colour operators inside them, which persist after ET).
 ///
 /// This is a performance-optimized variant of [`parse_content_stream`] that:
 /// 1. Skips text object blocks (BT…ET) at the byte level
@@ -174,6 +175,9 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
 /// `Object::Real` for each numeric operand. Common operators like `m`, `l`, `c`,
 /// `re`, `cm`, `rg` are parsed entirely from raw bytes.
 pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
+    // Inside BT…ET only colour operators are kept: colour is graphics state
+    // and outlives ET (BT/ET do not save/restore it).
+    let mut in_text = false;
     let estimated_capacity = data.len() / 20;
     let mut operators = Vec::with_capacity(estimated_capacity.min(100_000));
     let len = data.len();
@@ -201,7 +205,7 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                     i + 1 >= len || BYTE_CLASS[data[i + 1] as usize] != SCAN_ALPHA;
 
                 // Fast path: zero-operand single-char operators
-                if second_is_non_alpha {
+                if second_is_non_alpha && (!in_text || matches!(first_byte, b'g' | b'G')) {
                     let operands = &data[operand_start..i];
                     let op = match first_byte {
                         // Path painting (zero operands)
@@ -303,15 +307,32 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                 consecutive_errors = 0;
                 let operands = &data[operand_start..op_start];
 
-                // Skip BT/ET text blocks
-                if op == b"BT" {
-                    match scan_to_et(&data[i..]) {
-                        Some(rest) => {
-                            i = len - rest.len();
-                            operand_start = i;
-                        },
-                        None => break,
+                if in_text {
+                    let colour = matches!(
+                        op,
+                        b"cs"
+                            | b"CS"
+                            | b"sc"
+                            | b"SC"
+                            | b"scn"
+                            | b"SCN"
+                            | b"rg"
+                            | b"RG"
+                            | b"k"
+                            | b"K"
+                            | b"g"
+                            | b"G"
+                    );
+                    if op == b"ET" {
+                        in_text = false;
                     }
+                    if !colour {
+                        operand_start = i;
+                        continue;
+                    }
+                } else if op == b"BT" {
+                    in_text = true;
+                    operand_start = i;
                     continue;
                 }
 
@@ -352,10 +373,9 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                         b"B*" => Some(Operator::FillStrokeEvenOdd),
                         b"b*" => Some(Operator::CloseFillStrokeEvenOdd),
                         b"W*" => Some(Operator::ClipEvenOdd),
-                        // Skip text/color-space/shading operators that don't affect paths
+                        // Skip text/shading operators that don't affect paths
                         b"ET" | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tf" | b"Tr" | b"Ts" | b"Td"
-                        | b"TD" | b"Tm" | b"Tj" | b"TJ" | b"T*" | b"cs" | b"CS" | b"sc" | b"SC"
-                        | b"scn" | b"SCN" | b"ri" | b"sh" | b"EI" => {
+                        | b"TD" | b"Tm" | b"Tj" | b"TJ" | b"T*" | b"ri" | b"sh" | b"EI" => {
                             operand_start = i;
                             continue;
                         },

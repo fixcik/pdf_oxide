@@ -43,6 +43,35 @@ use crate::elements::{LineCap, LineJoin, PathContent, PathOperation};
 use crate::geometry::{Point, Rect};
 use crate::layout::Color;
 
+/// Colour space kind of the current fill/stroke colour, as far as path
+/// extraction can map it to RGB. `Unknown` (Pattern, Separation, DeviceN,
+/// Indexed, Lab, unresolvable names) means the colour has no sound RGB value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathColorSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+    /// ICCBased with N=4: same mapping as `Cmyk`, but the initial colour is
+    /// all-zero components (ISO 32000-1:2008 §8.6.5.5), i.e. white.
+    IccCmyk,
+    Unknown,
+}
+
+impl PathColorSpace {
+    /// Map `sc`/`scn` components to RGB; `None` when the count does not match
+    /// the space or the space is `Unknown`.
+    pub(crate) fn to_rgb(self, c: &[f32]) -> Option<(f32, f32, f32)> {
+        match (self, c.len()) {
+            (Self::Gray, 1) => Some((c[0], c[0], c[0])),
+            (Self::Rgb, 3) => Some((c[0], c[1], c[2])),
+            (Self::Cmyk | Self::IccCmyk, 4) => {
+                Some(crate::color::cmyk_to_rgb(c[0], c[1], c[2], c[3]))
+            },
+            _ => None,
+        }
+    }
+}
+
 /// Copy-only graphics state for path extraction (no String/Vec fields).
 /// Enables allocation-free q/Q save/restore unlike the full [`GraphicsState`].
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +79,8 @@ pub(crate) struct PathGraphicsState {
     pub ctm: Matrix,
     pub stroke_color_rgb: (f32, f32, f32),
     pub fill_color_rgb: (f32, f32, f32),
+    pub stroke_space: PathColorSpace,
+    pub fill_space: PathColorSpace,
     pub line_width: f32,
     pub line_cap: u8,
     pub line_join: u8,
@@ -61,6 +92,8 @@ impl PathGraphicsState {
             ctm: Matrix::identity(),
             stroke_color_rgb: (0.0, 0.0, 0.0),
             fill_color_rgb: (0.0, 0.0, 0.0),
+            stroke_space: PathColorSpace::Gray,
+            fill_space: PathColorSpace::Gray,
             line_width: 1.0,
             line_cap: 0,
             line_join: 0,
@@ -157,6 +190,8 @@ pub struct PathExtractor {
     max_xobject_depth: usize,
     /// Cached XObject name → ObjectRef mapping, built on first lookup.
     cached_xobject_dict: Option<std::collections::HashMap<String, crate::object::ObjectRef>>,
+    /// `cs` operand name -> resolved space, for the current resource scope.
+    color_space_cache: std::collections::HashMap<String, PathColorSpace>,
     /// Stack of active Optional Content Group (PDF "layer") names. Each
     /// `BDC`/`BMC` operator (any tag) pushes one entry and each `EMC` pops
     /// one, so the depth tracks the marked-content nesting precisely
@@ -188,6 +223,7 @@ impl PathExtractor {
             processed_xobjects: std::collections::HashSet::new(),
             max_xobject_depth: 100,
             cached_xobject_dict: None,
+            color_space_cache: std::collections::HashMap::new(),
             oc_layer_stack: Vec::new(),
         }
     }
@@ -271,6 +307,7 @@ impl PathExtractor {
     ) {
         let prev_resources = std::mem::replace(&mut self.resources, new_resources);
         let prev_cache = self.cached_xobject_dict.take();
+        self.color_space_cache.clear();
         (prev_resources, prev_cache)
     }
 
@@ -285,6 +322,16 @@ impl PathExtractor {
     ) {
         self.resources = saved.0;
         self.cached_xobject_dict = saved.1;
+        self.color_space_cache.clear();
+    }
+
+    /// Cached resolution of a `cs` operand in the current resource scope.
+    pub(crate) fn cached_color_space(&self, name: &str) -> Option<PathColorSpace> {
+        self.color_space_cache.get(name).copied()
+    }
+
+    pub(crate) fn cache_color_space(&mut self, name: &str, space: PathColorSpace) {
+        self.color_space_cache.insert(name.to_string(), space);
     }
 
     /// Resolve an XObject name to its ObjectRef, caching the XObject dict on first call.

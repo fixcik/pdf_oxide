@@ -19549,6 +19549,123 @@ impl PdfDocument {
         Ok(content_data)
     }
 
+    /// Resolve a colour-space operand of `cs`/`CS` to the kind path extraction
+    /// can map to RGB. Only Device*, Cal* and ICCBased (by `/N`) are mapped;
+    /// Pattern, Separation, DeviceN, Indexed, Lab and unresolvable names are
+    /// `Unknown`, for which `sc`/`scn` leave the current colour untouched.
+    fn resolve_path_color_space(
+        &self,
+        name: &str,
+        resources: Option<&Object>,
+    ) -> crate::extractors::paths::PathColorSpace {
+        use crate::extractors::paths::PathColorSpace as Cs;
+        let by_family = |family: &str, n: Option<i64>| match (family, n) {
+            ("DeviceGray" | "CalGray", _) | ("ICCBased", Some(1)) => Cs::Gray,
+            ("DeviceRGB" | "CalRGB", _) | ("ICCBased", Some(3)) => Cs::Rgb,
+            ("DeviceCMYK", _) => Cs::Cmyk,
+            ("ICCBased", Some(4)) => Cs::IccCmyk,
+            _ => Cs::Unknown,
+        };
+        if name.starts_with("Device") {
+            return by_family(name, None);
+        }
+        let lookup = || -> Option<Cs> {
+            // The scope's resources are already resolved; only the
+            // /ColorSpace entry and the space itself may be references.
+            let spaces = resources?.as_dict()?.get("ColorSpace")?;
+            let spaces = self.resolve_object(spaces).ok()?;
+            let entry = self.resolve_object(spaces.as_dict()?.get(name)?).ok()?;
+            if let Some(family) = entry.as_name() {
+                return Some(by_family(family, None));
+            }
+            let arr = entry.as_array()?;
+            let family = self.resolve_object(arr.first()?).ok()?;
+            let family = family.as_name()?;
+            let n = if family == "ICCBased" {
+                let stream = self.resolve_object(arr.get(1)?).ok()?;
+                stream.as_dict()?.get("N")?.as_integer()
+            } else {
+                None
+            };
+            Some(by_family(family, n))
+        };
+        lookup().unwrap_or_else(|| {
+            log::debug!("path colour space {:?} not resolvable; colour unchanged", name);
+            Cs::Unknown
+        })
+    }
+
+    /// Apply `cs`/`CS`/`sc`/`SC`/`scn`/`SCN` to the path graphics state and
+    /// extractor (ISO 32000-1:2008 §8.6.8). A space that cannot be mapped to
+    /// RGB (Pattern, tint and index spaces, mismatched component counts)
+    /// leaves the current colour exactly as it was.
+    fn apply_path_color_op(
+        &self,
+        op: crate::content::Operator,
+        state_stack: &mut crate::extractors::paths::PathGraphicsStateStack,
+        extractor: &mut crate::extractors::paths::PathExtractor,
+    ) {
+        use crate::content::Operator;
+        use crate::extractors::paths::PathColorSpace as Cs;
+        use crate::layout::Color;
+
+        // (is_fill, components, is_pattern)
+        let (fill, comps, pattern) = match op {
+            Operator::SetFillColorSpace { ref name }
+            | Operator::SetStrokeColorSpace { ref name } => {
+                let fill = matches!(op, Operator::SetFillColorSpace { .. });
+                let space = if name == "Pattern" {
+                    Cs::Unknown
+                } else if let Some(cached) = extractor.cached_color_space(name) {
+                    cached
+                } else {
+                    let resolved =
+                        self.resolve_path_color_space(name, extractor.current_resources());
+                    extractor.cache_color_space(name, resolved);
+                    resolved
+                };
+                let st = state_stack.current_mut();
+                if fill {
+                    st.fill_space = space;
+                } else {
+                    st.stroke_space = space;
+                }
+                // §8.6.8: selecting a space resets the colour to its initial
+                // value. Known only for mapped spaces; otherwise unchanged.
+                let initial = match space {
+                    Cs::Gray | Cs::Rgb | Cs::Cmyk => (0.0, 0.0, 0.0),
+                    Cs::IccCmyk => (1.0, 1.0, 1.0),
+                    Cs::Unknown => return,
+                };
+                let color = Color::new(initial.0, initial.1, initial.2);
+                if fill {
+                    st.fill_color_rgb = initial;
+                    extractor.set_fill_color(color);
+                } else {
+                    st.stroke_color_rgb = initial;
+                    extractor.set_stroke_color(color);
+                }
+                return;
+            },
+            Operator::SetFillColor { components } => (true, components, false),
+            Operator::SetStrokeColor { components } => (false, components, false),
+            Operator::SetFillColorN { components, name } => (true, components, name.is_some()),
+            Operator::SetStrokeColorN { components, name } => (false, components, name.is_some()),
+            _ => return,
+        };
+        let st = state_stack.current_mut();
+        let space = if fill { st.fill_space } else { st.stroke_space };
+        let rgb = if pattern { None } else { space.to_rgb(&comps) };
+        let Some((r, g, b)) = rgb else { return };
+        if fill {
+            st.fill_color_rgb = (r, g, b);
+            extractor.set_fill_color(Color::new(r, g, b));
+        } else {
+            st.stroke_color_rgb = (r, g, b);
+            extractor.set_stroke_color(Color::new(r, g, b));
+        }
+    }
+
     /// Extract path (vector graphics) content from a page.
     ///
     /// This extracts all vector graphics operations from the page's content stream,
@@ -19657,32 +19774,53 @@ impl PdfDocument {
 
                 // Color operators (stroke)
                 Operator::SetStrokeRgb { r, g, b } => {
+                    state_stack.current_mut().stroke_space =
+                        crate::extractors::paths::PathColorSpace::Rgb;
                     state_stack.current_mut().stroke_color_rgb = (r, g, b);
                     extractor.set_stroke_color(Color::new(r, g, b));
                 },
                 Operator::SetStrokeGray { gray } => {
+                    state_stack.current_mut().stroke_space =
+                        crate::extractors::paths::PathColorSpace::Gray;
                     state_stack.current_mut().stroke_color_rgb = (gray, gray, gray);
                     extractor.set_stroke_color(Color::new(gray, gray, gray));
                 },
                 Operator::SetStrokeCmyk { c, m, y, k } => {
                     let (r, g, b) = crate::color::cmyk_to_rgb(c, m, y, k);
+                    state_stack.current_mut().stroke_space =
+                        crate::extractors::paths::PathColorSpace::Cmyk;
                     state_stack.current_mut().stroke_color_rgb = (r, g, b);
                     extractor.set_stroke_color(Color::new(r, g, b));
                 },
 
                 // Color operators (fill)
                 Operator::SetFillRgb { r, g, b } => {
+                    state_stack.current_mut().fill_space =
+                        crate::extractors::paths::PathColorSpace::Rgb;
                     state_stack.current_mut().fill_color_rgb = (r, g, b);
                     extractor.set_fill_color(Color::new(r, g, b));
                 },
                 Operator::SetFillGray { gray } => {
+                    state_stack.current_mut().fill_space =
+                        crate::extractors::paths::PathColorSpace::Gray;
                     state_stack.current_mut().fill_color_rgb = (gray, gray, gray);
                     extractor.set_fill_color(Color::new(gray, gray, gray));
                 },
                 Operator::SetFillCmyk { c, m, y, k } => {
                     let (r, g, b) = crate::color::cmyk_to_rgb(c, m, y, k);
+                    state_stack.current_mut().fill_space =
+                        crate::extractors::paths::PathColorSpace::Cmyk;
                     state_stack.current_mut().fill_color_rgb = (r, g, b);
                     extractor.set_fill_color(Color::new(r, g, b));
+                },
+
+                Operator::SetStrokeColorSpace { .. }
+                | Operator::SetFillColorSpace { .. }
+                | Operator::SetStrokeColor { .. }
+                | Operator::SetFillColor { .. }
+                | Operator::SetStrokeColorN { .. }
+                | Operator::SetFillColorN { .. } => {
+                    self.apply_path_color_op(op, &mut state_stack, &mut extractor);
                 },
 
                 // Line style operators
@@ -20284,30 +20422,50 @@ impl PdfDocument {
                 // Color and line style operators — must update both state_stack
                 // and extractor so q/Q save/restore works correctly.
                 Operator::SetStrokeRgb { r, g, b } => {
+                    state_stack.current_mut().stroke_space =
+                        crate::extractors::paths::PathColorSpace::Rgb;
                     state_stack.current_mut().stroke_color_rgb = (r, g, b);
                     extractor.set_stroke_color(Color::new(r, g, b));
                 },
                 Operator::SetStrokeGray { gray } => {
+                    state_stack.current_mut().stroke_space =
+                        crate::extractors::paths::PathColorSpace::Gray;
                     state_stack.current_mut().stroke_color_rgb = (gray, gray, gray);
                     extractor.set_stroke_color(Color::new(gray, gray, gray));
                 },
                 Operator::SetStrokeCmyk { c, m, y, k } => {
                     let (r, g, b) = crate::color::cmyk_to_rgb(c, m, y, k);
+                    state_stack.current_mut().stroke_space =
+                        crate::extractors::paths::PathColorSpace::Cmyk;
                     state_stack.current_mut().stroke_color_rgb = (r, g, b);
                     extractor.set_stroke_color(Color::new(r, g, b));
                 },
                 Operator::SetFillRgb { r, g, b } => {
+                    state_stack.current_mut().fill_space =
+                        crate::extractors::paths::PathColorSpace::Rgb;
                     state_stack.current_mut().fill_color_rgb = (r, g, b);
                     extractor.set_fill_color(Color::new(r, g, b));
                 },
                 Operator::SetFillGray { gray } => {
+                    state_stack.current_mut().fill_space =
+                        crate::extractors::paths::PathColorSpace::Gray;
                     state_stack.current_mut().fill_color_rgb = (gray, gray, gray);
                     extractor.set_fill_color(Color::new(gray, gray, gray));
                 },
                 Operator::SetFillCmyk { c, m, y, k } => {
                     let (r, g, b) = crate::color::cmyk_to_rgb(c, m, y, k);
+                    state_stack.current_mut().fill_space =
+                        crate::extractors::paths::PathColorSpace::Cmyk;
                     state_stack.current_mut().fill_color_rgb = (r, g, b);
                     extractor.set_fill_color(Color::new(r, g, b));
+                },
+                Operator::SetStrokeColorSpace { .. }
+                | Operator::SetFillColorSpace { .. }
+                | Operator::SetStrokeColor { .. }
+                | Operator::SetFillColor { .. }
+                | Operator::SetStrokeColorN { .. }
+                | Operator::SetFillColorN { .. } => {
+                    self.apply_path_color_op(op, state_stack, extractor);
                 },
                 Operator::SetLineWidth { width } => {
                     state_stack.current_mut().line_width = width;
