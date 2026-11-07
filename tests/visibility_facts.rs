@@ -326,6 +326,10 @@ fn is_rgb(c: Option<pdf_oxide::layout::Color>, rgb: (f32, f32, f32)) -> bool {
     })
 }
 
+fn process_black() -> (f32, f32, f32) {
+    pdf_oxide::color::cmyk_to_rgb(0.0, 0.0, 0.0, 1.0)
+}
+
 /// Colour spaces selected by resource name (`/Cs8 cs 1 scn`), as real files do.
 const NAMED_SPACES: &str = "/ColorSpace << \
     /Cs8 [/Separation /Black /DeviceCMYK 6 0 R] \
@@ -370,11 +374,12 @@ fn fill_color_resolves_named_separation_and_devicen_spaces() {
     // The span colour itself is unchanged (the count-based guess: white).
     assert!(is_rgb(Some(span_of(&s, "SEPBLACK").color), (1.0, 1.0, 1.0)));
     assert_eq!(span_of(&plain, "SEPBLACK").color, span_of(&s, "SEPBLACK").color);
-    assert!(is_rgb(facts_of(&s, "SEPBLACK").fill_color, (0.0, 0.0, 0.0)));
     assert!(is_rgb(facts_of(&s, "SPOTHALF").fill_color, (1.0, 0.5, 0.5)));
     assert!(is_rgb(facts_of(&s, "TYPEFOUR").fill_color, (0.75, 0.75, 0.75)));
     let k = span_of(&s, "PROCESSK");
     assert_eq!(facts_of(&s, "PROCESSK").fill_color, Some(k.color));
+    // Separation /Black is process black, as `0 0 0 1 k`.
+    assert_eq!(facts_of(&s, "SEPBLACK").fill_color, Some(k.color));
     assert_eq!(facts_of(&s, "DEVICEN").fill_color, Some(k.color));
     assert_eq!(facts_of(&s, "PATTERNED").fill_color, None);
     assert_eq!(facts_of(&s, "UNRESOLVED").fill_color, None);
@@ -395,7 +400,7 @@ fn fill_color_follows_q_and_resolves_path_fills() {
     let bytes = pdf("", NAMED_SPACES, content, &named_space_objects());
     let doc = open_with_facts(bytes);
     let s = spans(&doc);
-    assert!(is_rgb(facts_of(&s, "INSIDEQ").fill_color, (0.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "INSIDEQ").fill_color, process_black()));
     assert!(is_rgb(facts_of(&s, "AFTERQ").fill_color, (0.5, 0.5, 0.5)));
     let pv = doc.page_visibility(0).expect("page facts");
     let rects: Vec<_> = pv
@@ -426,7 +431,20 @@ fn form_resolves_a_redefined_colour_space_name_against_its_own_resources() {
         b"BT /F1 12 Tf /Cs8 cs 1 scn 72 650 Td (INFORM) Tj ET".to_vec(),
     ));
     let s = spans(&open_with_facts(pdf("", res, content, &extra)));
-    assert!(is_rgb(facts_of(&s, "PAGEBEFORE").fill_color, (0.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "PAGEBEFORE").fill_color, process_black()));
     assert!(is_rgb(facts_of(&s, "INFORM").fill_color, (1.0, 0.0, 0.0)));
-    assert!(is_rgb(facts_of(&s, "PAGEAFTER").fill_color, (0.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "PAGEAFTER").fill_color, process_black()));
+}
+
+#[test]
+fn stroke_colour_space_leaves_fill_alone_and_merged_runs_keep_the_first_colour() {
+    let content = b"BT /F1 12 Tf 0.5 g /Cs9 CS 1 SCN 72 700 Td (STROKEONLY) Tj ET\n\
+                    BT /F1 12 Tf 72 650 Td /Cs9 cs 1 scn (REDRUN) Tj 0.5 g (GRAYRUN) Tj ET\n\
+                    BT /F1 12 Tf 72 600 Td 0.5 g (GRAYFIRST) Tj /Cs9 cs 1 scn (REDSECOND) Tj ET";
+    let s = spans(&open_with_facts(pdf("", NAMED_SPACES, content, &named_space_objects())));
+    assert!(is_rgb(facts_of(&s, "STROKEONLY").fill_color, (0.5, 0.5, 0.5)));
+    // Span merging ignores `fill_color`: each merged span reports the colour
+    // of its first run (not the colour current at the end of the BT).
+    assert!(is_rgb(facts_of(&s, "REDRUN").fill_color, (1.0, 0.0, 0.0)));
+    assert!(is_rgb(facts_of(&s, "GRAYFIRST").fill_color, (0.5, 0.5, 0.5)));
 }

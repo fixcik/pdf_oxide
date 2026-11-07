@@ -16,8 +16,11 @@
 //! content; clip paths are tracked as the bbox of their points (curves by their
 //! control-point hull); a Form XObject without text is reported as one opaque
 //! [`PaintKind::Form`] event instead of being walked; strokes are not
-//! recorded. Fill colours of `Separation`/`DeviceN` spaces are evaluated only
-//! through Type 2 and Type 4 tint transforms (Type 0/3 give `None`).
+//! recorded. Fill colours: Separation `/All` maps to gray `1 - tint` and
+//! `/Black` plus DeviceN of process colorants map straight to CMYK; other
+//! Separation/DeviceN spaces are evaluated only through Type 2 and Type 4 tint
+//! transforms (Type 0/3 give `None`); an `Indexed` base must be Device*, Cal*
+//! or ICCBased.
 
 use crate::geometry::Rect;
 use crate::layout::Color;
@@ -53,9 +56,11 @@ pub struct SpanVisibility {
     /// the span's `color` in device-family spaces (`g`/`rg`/`k`, Device*,
     /// Cal*, Lab, ICCBased); `Separation`, `DeviceN` and `Indexed` spaces
     /// (literal or selected by resource name) are evaluated through their
-    /// tint transform / lookup table. `None` = unknown: a Pattern space, an
+    /// tint transform / lookup table. `None` = unknown (a Pattern space, an
     /// unresolvable colour-space name, an unsupported tint function or
-    /// alternate space, or the `/None` colorant.
+    /// alternate space) or nothing painted (the `/None` colorant). Span
+    /// merging ignores this field, so a merged span keeps its first run's
+    /// value.
     pub fill_color: Option<Color>,
 }
 
@@ -233,11 +238,12 @@ impl TintFn {
 /// A resolved Separation / DeviceN / Indexed colour space.
 #[derive(Debug)]
 pub(crate) enum TintSpace {
-    /// Separation `/All` or `/Black`: gray `1 - tint`.
+    /// Separation `/All`: gray `1 - tint`.
     Gray,
     /// Separation `/None`, or DeviceN of `/None` colorants only.
     NoInk,
-    /// DeviceN of process colorants: component -> CMYK slot (`None` ignored).
+    /// Separation `/Black` or DeviceN of process colorants: component ->
+    /// CMYK slot (`None` ignored).
     ProcessN(Vec<Option<usize>>),
     /// Tint transform into an alternate space.
     Function {
@@ -256,7 +262,10 @@ pub(crate) enum TintSpace {
 impl TintSpace {
     fn eval(&self, comps: &[f32]) -> Option<Color> {
         match self {
-            TintSpace::Gray => Process::Gray.to_color(&[1.0 - comps.first()?]),
+            TintSpace::Gray => match comps {
+                [t] => Process::Gray.to_color(&[1.0 - t]),
+                _ => None,
+            },
             TintSpace::NoInk => None,
             TintSpace::ProcessN(slots) => {
                 if comps.len() != slots.len() {
@@ -274,7 +283,11 @@ impl TintSpace {
                 if comps.len() != *n_in {
                     return None;
                 }
-                alt.to_color(&func.eval(comps)?)
+                let out = func.eval(comps)?;
+                if out.len() != alt.n() {
+                    return None;
+                }
+                alt.to_color(&out)
             },
             TintSpace::Indexed {
                 base,
@@ -307,7 +320,7 @@ impl TintSpace {
 
 /// How a colour space is treated by the facts.
 #[derive(Debug, Clone)]
-enum SpaceFact {
+pub(crate) enum SpaceFact {
     Device,
     Unknown,
     Tint(Arc<TintSpace>),
@@ -381,7 +394,7 @@ fn process(o: &Object, doc: Doc) -> Option<Process> {
     }
 }
 
-fn tint_fn(o: &Object, doc: Doc, n_in: usize) -> Option<TintFn> {
+fn tint_fn(o: &Object, doc: Doc, n_in: usize, n_out: usize) -> Option<TintFn> {
     let f = deref(o, doc)?;
     let d = f.as_dict()?;
     let pairs = |k: &str| -> Vec<[f64; 2]> {
@@ -395,14 +408,20 @@ fn tint_fn(o: &Object, doc: Doc, n_in: usize) -> Option<TintFn> {
     };
     match deref(d.get("FunctionType")?, doc)?.as_integer()? {
         2 if n_in == 1 => {
-            let c0 = nums(d.get("C0"), doc).unwrap_or_else(|| vec![0.0]);
-            let c1 = nums(d.get("C1"), doc).unwrap_or_else(|| vec![1.0]);
+            let c0 = match d.get("C0") {
+                Some(o) => nums(Some(o), doc)?,
+                None => vec![0.0],
+            };
+            let c1 = match d.get("C1") {
+                Some(o) => nums(Some(o), doc)?,
+                None => vec![1.0],
+            };
             let n = num(&*deref(d.get("N")?, doc)?)?;
             let domain = pairs("Domain")
                 .first()
                 .map(|p| [p[0].min(p[1]) as f32, p[0].max(p[1]) as f32])
                 .unwrap_or([0.0, 1.0]);
-            (c0.len() == c1.len()).then_some(TintFn::Type2 { c0, c1, n, domain })
+            (c0.len() == n_out && c1.len() == n_out).then_some(TintFn::Type2 { c0, c1, n, domain })
         },
         4 => {
             let program = crate::functions::Program::compile(&stream_bytes(o, doc)?).ok()?;
@@ -419,13 +438,17 @@ fn tint_fn(o: &Object, doc: Doc, n_in: usize) -> Option<TintFn> {
 fn tint_space(family: &str, a: &[Object], doc: Doc) -> Option<TintSpace> {
     match family {
         "Separation" => match deref(a.get(1)?, doc)?.as_name()? {
-            "All" | "Black" => Some(TintSpace::Gray),
+            "All" => Some(TintSpace::Gray),
+            "Black" => Some(TintSpace::ProcessN(vec![Some(3)])),
             "None" => Some(TintSpace::NoInk),
-            _ => Some(TintSpace::Function {
-                n_in: 1,
-                func: tint_fn(a.get(3)?, doc, 1)?,
-                alt: process(a.get(2)?, doc)?,
-            }),
+            _ => {
+                let alt = process(a.get(2)?, doc)?;
+                Some(TintSpace::Function {
+                    n_in: 1,
+                    func: tint_fn(a.get(3)?, doc, 1, alt.n())?,
+                    alt,
+                })
+            },
         },
         "DeviceN" => {
             let names = deref(a.get(1)?, doc)?;
@@ -451,11 +474,14 @@ fn tint_space(family: &str, a: &[Object], doc: Doc) -> Option<TintSpace> {
             match slots {
                 Some(s) if s.iter().all(|x| x.is_none()) => Some(TintSpace::NoInk),
                 Some(s) => Some(TintSpace::ProcessN(s)),
-                None => Some(TintSpace::Function {
-                    n_in: names.len(),
-                    func: tint_fn(a.get(3)?, doc, names.len())?,
-                    alt: process(a.get(2)?, doc)?,
-                }),
+                None => {
+                    let alt = process(a.get(2)?, doc)?;
+                    Some(TintSpace::Function {
+                        n_in: names.len(),
+                        func: tint_fn(a.get(3)?, doc, names.len(), alt.n())?,
+                        alt,
+                    })
+                },
             }
         },
         "Indexed" => {
@@ -525,8 +551,11 @@ pub(crate) struct VisibilityTracker {
     order: u32,
     pub(crate) paints: Vec<PaintEvent>,
     /// `cs` operand -> resolved space, for the current `/Resources` only.
-    cs_names: HashMap<String, SpaceFact>,
+    cs_names: CsNames,
 }
+
+/// `cs` operand -> resolved space cache of one `/Resources` scope.
+pub(crate) type CsNames = HashMap<String, SpaceFact>;
 
 impl VisibilityTracker {
     pub(crate) fn save(&mut self) {
@@ -551,6 +580,12 @@ impl VisibilityTracker {
     /// The extractor's `/Resources` changed: drop the name cache.
     pub(crate) fn resources_changed(&mut self) {
         self.cs_names.clear();
+    }
+
+    /// Swap in the name cache of another `/Resources` scope (Form entry /
+    /// exit), returning the current one.
+    pub(crate) fn swap_cs_names(&mut self, names: CsNames) -> CsNames {
+        std::mem::replace(&mut self.cs_names, names)
     }
 
     /// Fill state after `cs name`; `lookup` resolves `/Resources/ColorSpace/name`.
@@ -949,6 +984,76 @@ mod tests {
         assert!((half.clip_coverage - 0.5).abs() < 1e-6);
         assert_eq!(after.clip_coverage, 1.0);
         assert!(inside.paint_order < half.paint_order && half.paint_order < after.paint_order);
+    }
+
+    fn space(src: &str) -> Option<TintSpace> {
+        let (_, o) = crate::parser::parse_object(src.as_bytes()).expect("object");
+        let a = o.as_array().expect("array");
+        tint_space(a[0].as_name().unwrap(), a, None)
+    }
+
+    fn rgb(c: Option<Color>) -> Option<[i32; 3]> {
+        c.map(|c| [c.r, c.g, c.b].map(|v| (v * 1000.0).round() as i32))
+    }
+
+    #[test]
+    fn separation_tints() {
+        let cmyk = space(
+            "[/Separation /Spot /DeviceCMYK \
+             << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 1 0 0] /N 1 >>]",
+        )
+        .unwrap();
+        let (r, g, b) = crate::color::cmyk_to_rgb(0.0, 0.5, 0.0, 0.0);
+        assert_eq!(rgb(cmyk.eval(&[0.5])), rgb(Some(Color::new(r, g, b))));
+        // N = 2 and Domain [0 0.5]: t = 0.8 clips to 0.5, gray 0.25.
+        let pow = space(
+            "[/Separation /Spot /DeviceGray \
+             << /FunctionType 2 /Domain [0 0.5] /C0 [0] /C1 [1] /N 2 >>]",
+        )
+        .unwrap();
+        assert_eq!(rgb(pow.eval(&[0.8])), Some([250; 3]));
+        // C0/C1 not matching the alternate's component count.
+        assert!(
+            space("[/Separation /Spot /DeviceRGB << /FunctionType 2 /C0 [0] /C1 [1] /N 1 >>]")
+                .is_none()
+        );
+        assert!(
+            space("[/Separation /Spot /DeviceGray << /FunctionType 2 /C1 (x) /N 1 >>]").is_none()
+        );
+        let none = space("[/Separation /None /DeviceGray << /FunctionType 2 /N 1 >>]").unwrap();
+        assert_eq!(none.eval(&[1.0]), None);
+        let all = space("[/Separation /All /DeviceGray << /FunctionType 2 /N 1 >>]").unwrap();
+        assert_eq!(rgb(all.eval(&[0.25])), Some([750; 3]));
+        assert_eq!(all.eval(&[0.25, 0.5]), None);
+    }
+
+    #[test]
+    fn devicen_spot_and_process_through_type4() {
+        let (_, o) =
+            crate::parser::parse_object(b"[/DeviceN [/Spot /Black] /DeviceGray 0]").unwrap();
+        let mut a = o.as_array().unwrap().clone();
+        let mut dict = HashMap::new();
+        dict.insert("FunctionType".to_string(), Object::Integer(4));
+        // gray = 1 - max(spot, black)
+        a[3] = Object::Stream {
+            dict,
+            data: bytes::Bytes::from_static(b"{ 2 copy lt { exch } if pop 1 exch sub }"),
+        };
+        let t = tint_space("DeviceN", &a, None).unwrap();
+        assert_eq!(rgb(t.eval(&[0.2, 0.6])), Some([400; 3]));
+        assert_eq!(t.eval(&[0.2]), None, "component count");
+        // Output count must match the alternate (gray needs exactly one).
+        a[2] = Object::Name("DeviceRGB".into());
+        assert_eq!(tint_space("DeviceN", &a, None).unwrap().eval(&[0.2, 0.6]), None);
+    }
+
+    #[test]
+    fn malformed_indexed_is_unknown() {
+        assert!(space("[/Indexed /DeviceRGB 300 <FF0000>]").is_none());
+        let short = space("[/Indexed /DeviceRGB 2 <FF0000>]").unwrap();
+        assert_eq!(rgb(short.eval(&[0.0])), Some([1000, 0, 0]));
+        assert_eq!(short.eval(&[2.0]), None);
+        assert_eq!(short.eval(&[f32::NAN]), None);
     }
 
     #[test]

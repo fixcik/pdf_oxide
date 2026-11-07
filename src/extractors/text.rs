@@ -5620,10 +5620,8 @@ impl<'doc> TextExtractor<'doc> {
                     !matches!(op, Operator::Stroke | Operator::CloseAndStroke | Operator::EndPath);
                 let suppressed = self.is_content_suppressed();
                 let state = self.state_stack.current();
-                let color = (state.fill_color_space != "Pattern").then(|| {
-                    let (r, g, b) = state.fill_color_rgb;
-                    Color::new(r, g, b)
-                });
+                let (r, g, b) = state.fill_color_rgb;
+                let color = Some(Color::new(r, g, b));
                 if let Some(v) = self.vis.as_mut() {
                     v.end_path(fill, suppressed, color);
                 }
@@ -7539,6 +7537,7 @@ impl<'doc> TextExtractor<'doc> {
                 let saved_fonts;
                 let saved_resources;
                 let saved_xobj_cache;
+                let mut saved_cs_names = None;
 
                 if has_own_resources {
                     saved_fonts = Some(self.fonts.clone());
@@ -7569,7 +7568,7 @@ impl<'doc> TextExtractor<'doc> {
 
                     self.resources = Some(xobj_res);
                     if let Some(v) = self.vis.as_mut() {
-                        v.resources_changed();
+                        saved_cs_names = Some(v.swap_cs_names(Default::default()));
                     }
                 } else {
                     saved_fonts = None;
@@ -7779,8 +7778,8 @@ impl<'doc> TextExtractor<'doc> {
                 }
                 if let Some(res) = saved_resources {
                     self.resources = Some(res);
-                    if let Some(v) = self.vis.as_mut() {
-                        v.resources_changed();
+                    if let (Some(v), Some(names)) = (self.vis.as_mut(), saved_cs_names) {
+                        v.swap_cs_names(names);
                     }
                 }
                 if let Some(cache) = saved_xobj_cache {
