@@ -251,3 +251,36 @@ fn facts_do_not_change_extracted_text() {
     };
     assert_eq!(text(&plain), text(&with));
 }
+
+#[test]
+fn page_facts_follow_the_layer_filter_of_the_structured_call() {
+    let content = b"BT /F1 12 Tf 72 700 Td (BODY) Tj ET\nq 100 0 0 100 50 50 cm /Im0 Do Q";
+    let catalog = "/OCProperties << /OCGs [7 0 R] /D << /OFF [7 0 R] >> >>";
+    let res = "/XObject << /Im0 6 0 R >>";
+    let image = (
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
+         /BitsPerComponent 8 /OC 7 0 R >>"
+            .to_string(),
+        vec![0x00],
+    );
+    let ocg = ("<< /Type /OCG /Name (HiddenLayer) >>".to_string(), Vec::new());
+    let doc = open_with_facts(pdf(catalog, res, content, &[image, ocg]));
+    let images = |d: &PdfDocument| {
+        d.page_visibility(0)
+            .expect("page facts")
+            .paints
+            .iter()
+            .filter(|p| p.kind == PaintKind::Image)
+            .count()
+    };
+    doc.extract_structured(0).unwrap();
+    assert_eq!(images(&doc), 1, "unfiltered: the OC image is a paint");
+    let off = compute_default_off_ocgs(&doc);
+    doc.extract_structured_filtered(0, off, HashSet::new())
+        .unwrap();
+    assert_eq!(images(&doc), 0, "filtered: a hidden-layer image is not drawn");
+    // Another API extracting the page unfiltered must not replace the facts.
+    let _ = doc.classify_page(0);
+    let _ = doc.extract_spans(0);
+    assert_eq!(images(&doc), 0);
+}

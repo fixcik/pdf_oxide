@@ -5548,10 +5548,14 @@ impl<'doc> TextExtractor<'doc> {
     /// The XObject dict carries `/OC` naming an excluded layer (§8.11.3.3:
     /// such an XObject is not drawn).
     fn xobject_oc_hidden(&self, dict: &HashMap<String, Object>) -> bool {
+        self.oc_entry_hidden(dict.get("OC"))
+    }
+
+    fn oc_entry_hidden(&self, oc: Option<&Object>) -> bool {
         if self.excluded_layers.is_empty() {
             return false;
         }
-        let (Some(oc), Some(doc)) = (dict.get("OC"), self.document) else {
+        let (Some(oc), Some(doc)) = (oc, self.document) else {
             return false;
         };
         let resolved = match oc.as_reference() {
@@ -5566,72 +5570,43 @@ impl<'doc> TextExtractor<'doc> {
 
     /// Record an image or text-free form XObject as a paint event.
     fn record_xobject_paint(&mut self, xobject_ref: ObjectRef) {
+        use crate::cache::MutexExt as _;
+        use crate::extractors::visibility::XObjectPaintMeta;
         if self.vis.is_none() || self.is_content_suppressed() {
             return;
         }
         let Some(doc) = self.document else {
             return;
         };
-        let Ok(obj) = doc.load_object(xobject_ref) else {
-            return;
+        // The dict facts are cached per document: a cache hit in
+        // `load_object` still clones the whole stream (image bytes included).
+        let cached = doc
+            .xobject_paint_meta
+            .lock_or_recover()
+            .get(&xobject_ref)
+            .cloned();
+        let meta = match cached {
+            Some(m) => m,
+            None => {
+                let Ok(obj) = doc.load_object(xobject_ref) else {
+                    return;
+                };
+                let Some(d) = obj.as_dict() else {
+                    return;
+                };
+                let m = std::sync::Arc::new(XObjectPaintMeta::from_dict(d));
+                doc.xobject_paint_meta
+                    .lock_or_recover()
+                    .insert(xobject_ref, m.clone());
+                m
+            },
         };
-        let Some(d) = obj.as_dict() else {
-            return;
-        };
-        if self.xobject_oc_hidden(d) {
+        if self.oc_entry_hidden(meta.oc.as_ref()) {
             return;
         }
         let ctm = self.state_stack.current().ctm;
-        match d.get("Subtype").and_then(|s| s.as_name()) {
-            Some("Image") => {
-                let masked = d.get("SMask").is_some_and(|m| !m.is_null())
-                    || d.get("Mask").is_some_and(|m| !m.is_null())
-                    || d.get("ImageMask").and_then(|o| o.as_bool()) == Some(true);
-                if let Some(v) = self.vis.as_mut() {
-                    v.image(&ctm, masked);
-                }
-            },
-            Some("Form") => {
-                let bbox = match d.get("BBox") {
-                    Some(Object::Array(a)) if a.len() >= 4 => {
-                        let f = |i: usize| match a.get(i) {
-                            Some(Object::Real(v)) => *v as f32,
-                            Some(Object::Integer(v)) => *v as f32,
-                            _ => 0.0,
-                        };
-                        [
-                            f(0).min(f(2)),
-                            f(1).min(f(3)),
-                            f(0).max(f(2)),
-                            f(1).max(f(3)),
-                        ]
-                    },
-                    _ => return,
-                };
-                let matrix = match d.get("Matrix") {
-                    Some(Object::Array(a)) if a.len() >= 6 => {
-                        let f = |i: usize| match a.get(i) {
-                            Some(Object::Real(v)) => *v as f32,
-                            Some(Object::Integer(v)) => *v as f32,
-                            _ => 0.0,
-                        };
-                        Matrix {
-                            a: f(0),
-                            b: f(1),
-                            c: f(2),
-                            d: f(3),
-                            e: f(4),
-                            f: f(5),
-                        }
-                    },
-                    _ => Matrix::identity(),
-                };
-                let form_ctm = matrix.multiply(&ctm);
-                if let Some(v) = self.vis.as_mut() {
-                    v.form(&form_ctm, bbox);
-                }
-            },
-            _ => {},
+        if let Some(v) = self.vis.as_mut() {
+            v.xobject(&ctm, &meta);
         }
     }
 

@@ -593,6 +593,15 @@ pub struct PdfDocument {
     visibility_facts: std::sync::atomic::AtomicBool,
     /// Per-page visibility facts from the last extraction with facts on.
     page_visibility: Mutex<HashMap<usize, crate::extractors::visibility::PageVisibility>>,
+    /// Paint events of the last raw extraction per `(page, filtered)`; the
+    /// reading-order path publishes the matching one into `page_visibility`,
+    /// so an unfiltered extraction run by another API (e.g. `classify_page`)
+    /// cannot replace the facts of a filtered `extract_structured_filtered`.
+    raw_paints: Mutex<HashMap<(usize, bool), Vec<crate::extractors::visibility::PaintEvent>>>,
+    /// Per-XObject dict facts for visibility paint events (see
+    /// `TextExtractor::record_xobject_paint`).
+    pub(crate) xobject_paint_meta:
+        Mutex<HashMap<ObjectRef, std::sync::Arc<crate::extractors::visibility::XObjectPaintMeta>>>,
     /// Per-page lightweight search index (page text + span bounding boxes,
     /// no fonts/glyph widths) built lazily by `search()`/`search_page()` and
     /// reused across repeated calls on the same document. Unlike
@@ -1369,6 +1378,8 @@ impl PdfDocument {
             refine_char_x_offsets: std::sync::atomic::AtomicBool::new(true),
             visibility_facts: std::sync::atomic::AtomicBool::new(false),
             page_visibility: Mutex::new(HashMap::new()),
+            raw_paints: Mutex::new(HashMap::new()),
+            xobject_paint_meta: Mutex::new(HashMap::new()),
             search_index: Mutex::new(HashMap::new()),
             page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
@@ -7507,12 +7518,16 @@ impl PdfDocument {
         self.page_raw_spans_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         self.page_visibility.lock_or_recover().clear();
+        self.raw_paints.lock_or_recover().clear();
     }
 
-    /// Page-level visibility facts recorded by the last span extraction of
-    /// `page_index` while [`set_visibility_facts`](Self::set_visibility_facts)
-    /// was on; `None` if the page has not been extracted with facts on (or
-    /// carries no text, so extraction stopped before the content walk).
+    /// Page-level visibility facts of the last
+    /// [`extract_structured`](Self::extract_structured) /
+    /// [`extract_structured_filtered`](Self::extract_structured_filtered) /
+    /// `extract_spans_*with_reading_order` call for `page_index` while
+    /// [`set_visibility_facts`](Self::set_visibility_facts) was on (paints
+    /// follow that call's layer/ink filter); `None` if no such call was made
+    /// with facts on.
     /// Kept per page for the document's lifetime (a few KB per page).
     pub fn page_visibility(
         &self,
@@ -13118,7 +13133,13 @@ impl PdfDocument {
     ///
     /// `get_page_visible_box` returns `(llx, lly, urx, ury)` - absolute corner
     /// coordinates per ISO 32000-1 s7.7.3.3, NOT `(x, y, width, height)`.
-    fn drop_offpage_spans(&self, page_index: usize, spans: &mut Vec<crate::layout::TextSpan>) {
+    /// Returns `(spans, non-whitespace chars)` dropped, counted only while
+    /// visibility facts are on (`(0, 0)` otherwise).
+    fn drop_offpage_spans(
+        &self,
+        page_index: usize,
+        spans: &mut Vec<crate::layout::TextSpan>,
+    ) -> (usize, usize) {
         if let Ok((llx, lly, urx, ury)) = self.get_page_visible_box(page_index) {
             const EDGE_TOLERANCE_PT: f32 = 2.0;
             // Normalise corners: some producers write the MediaBox with swapped
@@ -13136,19 +13157,17 @@ impl PdfDocument {
                 let sy2 = span.bbox.y + span.bbox.height;
                 sx2 > left && sx1 < right && sy2 > bottom && sy1 < top
             };
+            let mut dropped = (0usize, 0usize);
             if self.visibility_facts.load(Ordering::Relaxed) {
-                let (mut n, mut chars) = (0usize, 0usize);
                 for s in spans.iter().filter(|s| !on_page(s)) {
-                    n += 1;
-                    chars += s.text.chars().filter(|c| !c.is_whitespace()).count();
+                    dropped.0 += 1;
+                    dropped.1 += s.text.chars().filter(|c| !c.is_whitespace()).count();
                 }
-                let mut pv = self.page_visibility.lock_or_recover();
-                let e = pv.entry(page_index).or_default();
-                e.offpage_spans = n;
-                e.offpage_chars = chars;
             }
             spans.retain(on_page);
+            return dropped;
         }
+        (0, 0)
     }
 
     fn postprocess_spans(
@@ -17410,6 +17429,7 @@ impl PdfDocument {
         // on top of the stack inside the extractor.
         extractor.set_page_index(page_index as u32);
         let visibility_facts = self.visibility_facts.load(Ordering::Relaxed);
+        let filtered = !excluded_layers.is_empty() || !excluded_inks.is_empty();
         if visibility_facts {
             extractor.enable_visibility_facts();
         }
@@ -17434,11 +17454,9 @@ impl PdfDocument {
         let spans = extractor.extract_text_spans(&content_data)?;
         if visibility_facts {
             let paints = extractor.take_paint_events();
-            self.page_visibility
+            self.raw_paints
                 .lock_or_recover()
-                .entry(page_index)
-                .or_default()
-                .paints = paints;
+                .insert((page_index, filtered), paints);
         }
         // Drain MCIDs whose in-stream /ActualText was applied during
         // extraction and stash on the document so the struct-tree-
@@ -17636,7 +17654,8 @@ impl PdfDocument {
     ) -> Result<Vec<crate::layout::TextSpan>> {
         // Extract raw spans using the common extraction logic. The unfiltered
         // path is kept verbatim for empty sets so existing callers are unchanged.
-        let mut spans = if excluded_layers.is_empty() && excluded_inks.is_empty() {
+        let filtered = !(excluded_layers.is_empty() && excluded_inks.is_empty());
+        let mut spans = if !filtered {
             self.extract_spans_raw(page_index)?
         } else {
             self.extract_spans_raw_filtered(page_index, excluded_layers, excluded_inks)?
@@ -17648,7 +17667,23 @@ impl PdfDocument {
         // this via `postprocess_spans`; the reading-order path must too, or it
         // emits every page's worth of spans (measured: a stats report emitted a
         // chart's full hidden data table, ~5x the visible label count).
-        self.drop_offpage_spans(page_index, &mut spans);
+        let (offpage_spans, offpage_chars) = self.drop_offpage_spans(page_index, &mut spans);
+        if self.visibility_facts.load(Ordering::Relaxed) {
+            let paints = self
+                .raw_paints
+                .lock_or_recover()
+                .get(&(page_index, filtered))
+                .cloned()
+                .unwrap_or_default();
+            let pv = crate::extractors::visibility::PageVisibility {
+                paints,
+                offpage_spans,
+                offpage_chars,
+            };
+            self.page_visibility
+                .lock_or_recover()
+                .insert(page_index, pv);
+        }
 
         // Apply reading order strategy
         match reading_order {

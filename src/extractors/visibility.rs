@@ -338,6 +338,91 @@ impl VisibilityTracker {
     }
 }
 
+/// Dict facts of an image / form XObject needed for its paint event.
+#[derive(Debug)]
+pub(crate) struct XObjectPaintMeta {
+    /// `/OC` entry (unresolved).
+    pub(crate) oc: Option<crate::object::Object>,
+    kind: XObjectPaintKind,
+}
+
+#[derive(Debug)]
+enum XObjectPaintKind {
+    Image {
+        masked: bool,
+    },
+    Form {
+        bbox: [f32; 4],
+        matrix: crate::content::Matrix,
+    },
+    Other,
+}
+
+impl XObjectPaintMeta {
+    pub(crate) fn from_dict(d: &std::collections::HashMap<String, crate::object::Object>) -> Self {
+        use crate::object::Object;
+        let nums = |key: &str, n: usize| -> Option<Vec<f32>> {
+            match d.get(key) {
+                Some(Object::Array(a)) if a.len() >= n => Some(
+                    a.iter()
+                        .take(n)
+                        .map(|o| match o {
+                            Object::Real(v) => *v as f32,
+                            Object::Integer(v) => *v as f32,
+                            _ => 0.0,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            }
+        };
+        let kind = match d.get("Subtype").and_then(|s| s.as_name()) {
+            Some("Image") => XObjectPaintKind::Image {
+                masked: d.get("SMask").is_some_and(|m| !m.is_null())
+                    || d.get("Mask").is_some_and(|m| !m.is_null())
+                    || d.get("ImageMask").and_then(|o| o.as_bool()) == Some(true),
+            },
+            Some("Form") => match nums("BBox", 4) {
+                Some(b) => XObjectPaintKind::Form {
+                    bbox: [
+                        b[0].min(b[2]),
+                        b[1].min(b[3]),
+                        b[0].max(b[2]),
+                        b[1].max(b[3]),
+                    ],
+                    matrix: nums("Matrix", 6)
+                        .map(|m| crate::content::Matrix {
+                            a: m[0],
+                            b: m[1],
+                            c: m[2],
+                            d: m[3],
+                            e: m[4],
+                            f: m[5],
+                        })
+                        .unwrap_or_else(crate::content::Matrix::identity),
+                },
+                None => XObjectPaintKind::Other,
+            },
+            _ => XObjectPaintKind::Other,
+        };
+        Self {
+            oc: d.get("OC").cloned(),
+            kind,
+        }
+    }
+}
+
+impl VisibilityTracker {
+    /// Record an image / text-free form painted under `ctm`.
+    pub(crate) fn xobject(&mut self, ctm: &crate::content::Matrix, meta: &XObjectPaintMeta) {
+        match meta.kind {
+            XObjectPaintKind::Image { masked } => self.image(ctm, masked),
+            XObjectPaintKind::Form { bbox, matrix } => self.form(&matrix.multiply(ctm), bbox),
+            XObjectPaintKind::Other => {},
+        }
+    }
+}
+
 /// Fraction of `bbox` inside `clip` (1-D when the bbox is degenerate).
 fn coverage(bbox: &Rect, clip: Bounds) -> f32 {
     if clip[2] <= clip[0] || clip[3] <= clip[1] {

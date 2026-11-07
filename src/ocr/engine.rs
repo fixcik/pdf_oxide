@@ -58,6 +58,7 @@ impl OcrSpan {
 
         TextSpan {
             provenance: None,
+            visibility: None,
             artifact_type: None,
             text: self.text.clone(),
             bbox,
