@@ -20959,6 +20959,20 @@ impl PdfDocument {
                 }
             }
 
+            // Referenced /Widths CONTENT. The cheap hash folds only an inline
+            // /Widths array; an indirect one (what Word and most producers
+            // emit) contributed nothing, so two non-embedded fonts sharing
+            // /BaseFont + /FirstChar + /LastChar but carrying different
+            // per-document width tables (zeros for unused codes) collided and
+            // the global cache served a later document the earlier document's
+            // advances (zero-width glyphs, glued/split words).
+            if let Some(w @ Object::Reference(_)) = d.get("Widths") {
+                if let Some(w_obj) = self.resolve_indirect_for_hash(w) {
+                    22u8.hash(&mut hasher);
+                    Self::hash_pdf_object_deterministic(&w_obj, &mut hasher);
+                }
+            }
+
             // Simple fonts (Type1/TrueType) carry their embedded program on the
             // top-level /FontDescriptor. Two subset fonts that share a
             // /BaseFont name but embed different glyph programs must not alias.
@@ -21000,14 +21014,16 @@ impl PdfDocument {
                     }
                     // /W — per-CID horizontal widths, may use form-a
                     // (c [w1 w2 …]) or form-b (c_first c_last w).
-                    if let Some(w) = dd.get("W") {
+                    // Resolved first: a referenced /W would otherwise fold only
+                    // its object number, which is not unique across documents.
+                    if let Some(w) = dd.get("W").and_then(|w| self.resolve_indirect_for_hash(w)) {
                         14u8.hash(&mut hasher);
-                        Self::hash_pdf_object_deterministic(w, &mut hasher);
+                        Self::hash_pdf_object_deterministic(&w, &mut hasher);
                     }
                     // /W2 — per-CID vertical metrics, analogous to /W.
-                    if let Some(w2) = dd.get("W2") {
+                    if let Some(w2) = dd.get("W2").and_then(|w| self.resolve_indirect_for_hash(w)) {
                         15u8.hash(&mut hasher);
-                        Self::hash_pdf_object_deterministic(w2, &mut hasher);
+                        Self::hash_pdf_object_deterministic(&w2, &mut hasher);
                     }
                     // /CIDSystemInfo — folded so otherwise-identical dicts
                     // targeting different registries don't collide.
@@ -21115,6 +21131,16 @@ impl PdfDocument {
                 section.hash(hasher);
                 (variant as u8).hash(hasher);
                 self.fold_stream_bytes(ff, hasher);
+            }
+        }
+        // Descriptor metrics that `FontInfo::from_dict` reads (default width,
+        // weight/style inference, line box). Without them two non-embedded
+        // fonts differing only here would share one parsed `FontInfo`.
+        for key in ["Flags", "StemV", "FontWeight", "Ascent", "Descent"] {
+            if let Some(v) = dict.get(key) {
+                section.hash(hasher);
+                key.hash(hasher);
+                Self::hash_pdf_object_deterministic(v, hasher);
             }
         }
     }

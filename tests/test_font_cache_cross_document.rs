@@ -248,3 +248,96 @@ fn stream_cid_to_gid_map_distinguishes_otherwise_identical_fonts() {
         "fonts differing only in a stream /CIDToGIDMap must not alias in the cache"
     );
 }
+
+/// One-page "Hello world" in a non-embedded TrueType `Times New Roman` whose
+/// `/Widths` is an *indirect* object (as Word writes it). Both variants share
+/// every object number and every field the cheap identity hash reads inline;
+/// only the referenced width table differs. `zero_widths` zeroes every advance
+/// but the space, like a producer that zeroes codes the document never uses.
+fn build_truetype_indirect_widths_pdf(zero_widths: bool) -> Vec<u8> {
+    let widths: String = (32..=122u8)
+        .map(|c| match (c, zero_widths) {
+            (b' ', _) => "250",
+            (_, true) => "0",
+            (_, false) => "500",
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let content = "BT /F1 12 Tf 72 720 Td (Hello world) Tj ET";
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /TrueType /BaseFont /Times#20New#20Roman \
+         /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 122 \
+         /Widths 5 0 R /FontDescriptor 6 0 R >>"
+            .to_string(),
+        format!("[{widths}]"),
+        "<< /Type /FontDescriptor /FontName /Times#20New#20Roman /Flags 34 \
+         /FontBBox [-568 -216 2046 693] /ItalicAngle 0 /Ascent 891 /Descent -216 \
+         /CapHeight 693 /StemV 80 >>"
+            .to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objs.len());
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref_off = out.len();
+    let size = objs.len() + 1;
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for off in &offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+/// Width-sensitive fingerprint of page 0: every char with its bbox.
+fn char_boxes(bytes: Vec<u8>) -> Vec<String> {
+    let doc = PdfDocument::from_bytes(bytes).expect("parse synthetic PDF");
+    doc.extract_chars(0)
+        .expect("extract chars of page 0")
+        .iter()
+        .map(|c| format!("{:?} {:?}", c.char, c.bbox))
+        .collect()
+}
+
+/// A document's result must not depend on what the process parsed before it:
+/// B parsed right after A (same process, cache not cleared) must equal B on an
+/// empty cache. Before the fix, a referenced `/Widths` was not part of the
+/// font identity hash, so B was served A's widths from the global cache.
+#[test]
+fn referenced_widths_do_not_leak_across_documents() {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let docs = [
+        build_truetype_indirect_widths_pdf(true),
+        build_truetype_indirect_widths_pdf(false),
+    ];
+    let alone: Vec<Vec<String>> = docs
+        .iter()
+        .map(|d| {
+            clear_global_font_cache();
+            char_boxes(d.clone())
+        })
+        .collect();
+    assert_ne!(alone[0], alone[1], "the two width tables must give different boxes");
+
+    for (a, b) in [(0usize, 1usize), (1, 0)] {
+        clear_global_font_cache();
+        char_boxes(docs[a].clone());
+        assert_eq!(
+            char_boxes(docs[b].clone()),
+            alone[b],
+            "document {b} parsed after document {a} differs from document {b} alone \
+             (cross-document font-cache leak via referenced /Widths)"
+        );
+    }
+}
