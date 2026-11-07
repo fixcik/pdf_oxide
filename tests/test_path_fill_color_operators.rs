@@ -50,7 +50,7 @@ BT /DeviceRGB cs 1 0 0 sc (x) Tj ET 200 0 10 10 re f\n\
         b"<< /N 4 /Length 0 >>\nstream\n\nendstream".to_vec(),
         b"<< /PatternType 2 >>".to_vec(),
         [
-            b"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Length 49 \
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Length 34 \
               /Resources << /ColorSpace << /CSF [/ICCBased 5 0 R] >> >> >>\nstream\n"
                 .to_vec(),
             b"/CSF cs 0 1 1 scn 280 0 10 10 re f".to_vec(),
