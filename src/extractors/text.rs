@@ -2518,7 +2518,7 @@ impl<'doc> TextExtractor<'doc> {
     fn push_span(&mut self, mut span: TextSpan) {
         if let Some(vis) = self.vis.as_mut() {
             let render_mode = self.state_stack.current().render_mode;
-            span.visibility = Some(vis.span_facts(render_mode, &span.bbox));
+            span.visibility = Some(vis.span_facts(render_mode, &span.bbox, span.color));
         }
         self.spans.push(span);
     }
@@ -2577,6 +2577,9 @@ impl<'doc> TextExtractor<'doc> {
     /// This allows the extractor to access XObjects and fonts during extraction.
     pub fn set_resources(&mut self, resources: Object) {
         self.resources = Some(resources);
+        if let Some(v) = self.vis.as_mut() {
+            v.resources_changed();
+        }
     }
 
     /// Set the document reference for loading XObjects.
@@ -5537,6 +5540,12 @@ impl<'doc> TextExtractor<'doc> {
                 self.flush_tj_span_buffer()?;
                 self.apply_ext_gstate(dict_name);
             },
+            Operator::SetFillGray { .. }
+            | Operator::SetFillRgb { .. }
+            | Operator::SetFillCmyk { .. }
+            | Operator::SetFillColorSpace { .. }
+            | Operator::SetFillColor { .. }
+            | Operator::SetFillColorN { name: None, .. } => self.observe_fill(op)?,
             Operator::MoveTo { x, y } | Operator::LineTo { x, y } => {
                 if let Some(v) = self.vis.as_mut() {
                     v.path_point(&ctm, *x, *y);
@@ -5614,10 +5623,8 @@ impl<'doc> TextExtractor<'doc> {
                     !matches!(op, Operator::Stroke | Operator::CloseAndStroke | Operator::EndPath);
                 let suppressed = self.is_content_suppressed();
                 let state = self.state_stack.current();
-                let color = (state.fill_color_space != "Pattern").then(|| {
-                    let (r, g, b) = state.fill_color_rgb;
-                    Color::new(r, g, b)
-                });
+                let (r, g, b) = state.fill_color_rgb;
+                let color = Some(Color::new(r, g, b));
                 if let Some(v) = self.vis.as_mut() {
                     v.end_path(fill, suppressed, color);
                 }
@@ -5643,6 +5650,33 @@ impl<'doc> TextExtractor<'doc> {
             _ => {},
         }
         Ok(false)
+    }
+
+    /// Track the facts fill colour for a fill-colour operator. A change that
+    /// involves a non-device space first emits the pending span so it keeps
+    /// the colour it was drawn with.
+    fn observe_fill(&mut self, op: &Operator) -> Result<()> {
+        let Some(mut v) = self.vis.take() else {
+            return Ok(());
+        };
+        let new = match op {
+            Operator::SetFillColorSpace { name } => v.fill_after_cs(name, self.document, |n| {
+                self.resolve_resource_entry("ColorSpace", n)
+            }),
+            Operator::SetFillColor { components } | Operator::SetFillColorN { components, .. } => {
+                v.fill_after_sc(components)
+            },
+            _ => crate::extractors::visibility::Fill::Device,
+        };
+        let flush = v.fill_changes(&new);
+        self.vis = Some(v);
+        if flush {
+            self.flush_tj_span_buffer()?;
+        }
+        if let Some(v) = self.vis.as_mut() {
+            v.set_fill(new);
+        }
+        Ok(())
     }
 
     /// Resolve `/Resources/<category>/<name>` (following references).
@@ -7506,6 +7540,7 @@ impl<'doc> TextExtractor<'doc> {
                 let saved_fonts;
                 let saved_resources;
                 let saved_xobj_cache;
+                let mut saved_cs_names = None;
 
                 if has_own_resources {
                     saved_fonts = Some(self.fonts.clone());
@@ -7535,6 +7570,9 @@ impl<'doc> TextExtractor<'doc> {
                     }
 
                     self.resources = Some(xobj_res);
+                    if let Some(v) = self.vis.as_mut() {
+                        saved_cs_names = Some(v.swap_cs_names(Default::default()));
+                    }
                 } else {
                     saved_fonts = None;
                     saved_resources = None;
@@ -7743,6 +7781,9 @@ impl<'doc> TextExtractor<'doc> {
                 }
                 if let Some(res) = saved_resources {
                     self.resources = Some(res);
+                    if let (Some(v), Some(names)) = (self.vis.as_mut(), saved_cs_names) {
+                        v.swap_cs_names(names);
+                    }
                 }
                 if let Some(cache) = saved_xobj_cache {
                     self.cached_xobject_refs = cache;
