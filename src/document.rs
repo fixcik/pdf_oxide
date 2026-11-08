@@ -21819,10 +21819,10 @@ impl PdfDocument {
                 // in a later load_fonts call (e.g. an XObject font donating to a
                 // page-level font already in the extractor) requires sharing to run
                 // again even when all fonts came from cache.
-                extractor.share_truetype_cmaps();
-
-                // Cache this dict's own fonts by both ObjectRef and fingerprint
+                // Cache this dict's own fonts, taken before the CMap sharing below
+                // so no donation from the caller's fonts is cached with them.
                 let font_set = font_sets::own_fonts(extractor.get_font_set(), font_dict, &failed);
+                extractor.share_truetype_cmaps();
                 if let Some(fdr) = font_dict_ref {
                     self.font_set_cache
                         .lock_or_recover()

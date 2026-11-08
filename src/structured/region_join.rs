@@ -33,7 +33,8 @@ pub(super) fn kerned(prev: Option<&TextSpan>, next: &TextSpan) -> bool {
     };
     let letter = |c: Option<char>| c.is_some_and(char::is_alphabetic);
     let upright = |s: &TextSpan| s.rotation_degrees == 0.0 && !s.turned_bbox;
-    if prev.font_name != next.font_name
+    if !prev.font_size.is_finite()
+        || prev.font_name != next.font_name
         || (prev.font_size - next.font_size).abs() >= 0.01
         || prev.font_weight != next.font_weight
         || prev.is_italic != next.is_italic

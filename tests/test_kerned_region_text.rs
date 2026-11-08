@@ -14,7 +14,13 @@ const ADV: f32 = 6.6;
 
 fn pdf(content: &str) -> Vec<u8> {
     let widths: Vec<&str> = (32..=126)
-        .map(|c| if c == 46 { "100" } else { "600" })
+        .map(|c| {
+            if matches!(c, 46 | 105 | 106) {
+                "100"
+            } else {
+                "600"
+            }
+        })
         .collect();
     let objs = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -146,6 +152,8 @@ fn kerned_overlap_on_another_line_keeps_the_space() {
 
 #[test]
 fn rotated_runs_with_a_kerned_overlap_keep_the_space() {
+    // 90° runs advance along y, so the |dy| < 1 guard rejects them (the
+    // `upright` check is a second line of defence for this case).
     let y2 = 300.0 + ADV * 4.0 - 0.56;
     let c = format!(
         "BT /F1 11 Tf 0 1 -1 0 300 300 Tm (roun) Tj ET BT /F1 11 Tf 0 1 -1 0 300 {y2} Tm (ded) Tj ET"
