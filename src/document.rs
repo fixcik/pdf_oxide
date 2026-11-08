@@ -64,6 +64,7 @@ pub enum ReadingOrder {
 mod concurrency_tests;
 mod font_sets;
 mod layers;
+mod page_refs;
 mod pdf_reader;
 use pdf_reader::PdfReader;
 
@@ -620,6 +621,9 @@ pub struct PdfDocument {
     /// is populated — see `ensure_running_artifact_signatures`.
     running_artifact_signatures:
         Mutex<Option<std::sync::Arc<std::collections::HashMap<String, RunningArtifactSignature>>>>,
+    /// Page index → page object reference, from one page-tree walk (see
+    /// `document/page_refs.rs`); built on the first `get_page_ref`.
+    page_ref_index: Mutex<Option<Arc<Vec<ObjectRef>>>>,
     /// Document-wide article threads (`/Threads`), parsed once. Reading-order
     /// resolution consults them per page, and parsing walks the whole page
     /// tree — so without this the cost per page scaled with the document.
@@ -1373,6 +1377,7 @@ impl PdfDocument {
             page_words_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
             page_paths_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
             running_artifact_signatures: Mutex::new(None),
+            page_ref_index: Mutex::new(None),
             article_threads_cache: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
             accumulated_warnings: Mutex::new(Vec::new()),
@@ -1726,6 +1731,8 @@ impl PdfDocument {
                 // cache path (it is resolved independently), so clearing
                 // is always safe.
                 self.object_cache.lock_or_recover().clear();
+                // The page tree may read differently once decrypted.
+                *self.page_ref_index.lock_or_recover() = None;
                 log::debug!(
                     "authenticate(): object cache cleared after successful authentication \
                      to force re-decryption of any pre-auth cached objects"
@@ -5565,19 +5572,16 @@ impl PdfDocument {
     /// Get the object reference for a page by index.
     ///
     /// This is used by outline and annotations to find page references.
+    /// Served from a page-tree index built once per document; a page the
+    /// index does not hold falls back to the walk, for its error.
     pub(crate) fn get_page_ref(&self, page_index: usize) -> Result<ObjectRef> {
-        let catalog = self.catalog()?;
-        let catalog_dict = catalog.as_dict().ok_or_else(|| Error::InvalidObjectType {
-            expected: "Dictionary".to_string(),
-            found: catalog.type_name().to_string(),
-        })?;
-
-        let pages_ref = catalog_dict
-            .get("Pages")
-            .ok_or_else(|| Error::InvalidPdf("Catalog missing /Pages entry".to_string()))?
-            .as_reference()
-            .ok_or_else(|| Error::InvalidPdf("/Pages is not a reference".to_string()))?;
-
+        if let Some(page_ref) = self
+            .page_ref_index()
+            .and_then(|index| index.get(page_index).copied())
+        {
+            return Ok(page_ref);
+        }
+        let pages_ref = self.pages_root_ref()?;
         self.get_page_ref_recursive(pages_ref, page_index, &mut 0, &mut HashSet::new())
     }
 

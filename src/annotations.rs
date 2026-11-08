@@ -185,20 +185,22 @@ impl PdfDocument {
         let page_ref = self.get_page_ref(page_index)?;
         let page_obj = self.load_object(page_ref)?;
 
-        // Get annotations array
-        let annots = match page_obj.as_dict() {
-            Some(dict) => match dict.get("Annots") {
-                Some(Object::Array(arr)) => arr.clone(),
-                Some(Object::Reference(annot_ref)) => {
-                    // Annotations can be indirect
-                    match self.load_object(*annot_ref)? {
-                        Object::Array(arr) => arr,
-                        _ => return Ok(Vec::new()),
-                    }
-                },
-                _ => return Ok(Vec::new()), // No annotations
+        // Get annotations array (moved out of the owned page object)
+        let annots = match page_obj {
+            Object::Dictionary(mut dict) | Object::Stream { mut dict, .. } => {
+                match dict.remove("Annots") {
+                    Some(Object::Array(arr)) => arr,
+                    Some(Object::Reference(annot_ref)) => {
+                        // Annotations can be indirect
+                        match self.load_object(annot_ref)? {
+                            Object::Array(arr) => arr,
+                            _ => return Ok(Vec::new()),
+                        }
+                    },
+                    _ => return Ok(Vec::new()), // No annotations
+                }
             },
-            None => return Ok(Vec::new()),
+            _ => return Ok(Vec::new()),
         };
 
         let mut result = Vec::new();
