@@ -115,9 +115,12 @@ impl PdfDocument {
     ///
     /// When the document's default configuration hides layers, every text
     /// extraction of it (filtered or not, `extract_words` included) parses
-    /// large content streams in full, so a filtered and an unfiltered page
-    /// differ only by the suppressed content: a span of one that is missing
-    /// from the other belongs to a hidden layer.
+    /// large content streams in full, so visible text keeps the same glyph
+    /// geometry in a filtered and an unfiltered page. Span assembly still
+    /// differs: in the unfiltered page a hidden run can be merged into the
+    /// visible span next to it (or win a duplicate-overlay dedup against it),
+    /// so a span missing from the filtered page is not necessarily hidden
+    /// text in full.
     pub fn extract_structured_with_layer_filter(
         &self,
         page_index: usize,

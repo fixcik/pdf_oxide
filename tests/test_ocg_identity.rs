@@ -339,3 +339,32 @@ fn filtered_and_unfiltered_extraction_agree_on_a_large_stream() {
         .expect("Pears word");
     assert!((pears.bbox.y - y("Pears")).abs() < 0.5);
 }
+
+#[test]
+fn a_hidden_run_inside_a_visible_text_object_is_cut_from_the_filtered_page() {
+    use pdf_oxide::document::ReadingOrder;
+    let doc = open(pdf(
+        "/OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] >> >>",
+        "/Properties << /a 6 0 R >>",
+        b"BT /F1 12 Tf 72 700 Td (Total ) Tj /OC /a BDC (PWNED) Tj EMC ET",
+        &["<< /Type /OCG /Name (L) >>"],
+    ));
+    let filter = LayerFilter::document_default(&doc);
+    let shown: Vec<String> = doc
+        .extract_spans_with_layer_filter(0, ReadingOrder::default(), &filter)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    // The unfiltered page assembles one span "Total PWNED" here: a span
+    // missing from the filtered page is not necessarily all hidden text.
+    let full: Vec<String> = doc
+        .extract_spans(0)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    assert!(full.iter().any(|t| t.contains("PWNED")), "{full:?}");
+    assert!(shown.iter().all(|t| !t.contains("PWNED")), "{shown:?}");
+    assert!(shown.iter().any(|t| t.contains("Total")), "{shown:?}");
+}
