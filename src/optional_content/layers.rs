@@ -58,6 +58,10 @@ impl OcGroupState for HashSet<String> {
 pub struct LayerFilter {
     names: HashSet<String>,
     off: HashSet<ObjectRef>,
+    /// The document has optional content: membership dictionaries (OCMDs)
+    /// can hide content even when no group is off (`/VE [/Not g]`,
+    /// `/P /AnyOff`), so the filter must be evaluated.
+    evaluates_oc: bool,
 }
 
 impl LayerFilter {
@@ -76,8 +80,9 @@ impl LayerFilter {
     }
 
     /// The groups that `/OCProperties /D` (the default viewing configuration)
-    /// turns off, identified by reference. Empty when the document has no
-    /// optional content or its default hides nothing.
+    /// turns off, identified by reference. Empty only when the document has
+    /// no optional content (`/OCProperties`): with it, OCMDs over groups
+    /// that are on can still hide content.
     pub fn document_default(doc: &PdfDocument) -> Self {
         let mut filter = Self::default();
         let Some(oc) = doc
@@ -90,6 +95,7 @@ impl LayerFilter {
         let Some(oc) = oc.as_dict() else {
             return filter;
         };
+        filter.evaluates_oc = true;
         let Some(d) = resolved(oc.get("D"), doc) else {
             return filter;
         };
@@ -98,8 +104,11 @@ impl LayerFilter {
         };
         filter.off = if d.get("BaseState").and_then(|o| o.as_name()) == Some("OFF") {
             let on = refs(d.get("ON"), doc);
+            // Applied in viewer order (poppler, pdf.js): base state, then
+            // /ON, then /OFF — a group listed in both ends up off.
             let mut all = refs(oc.get("OCGs"), doc);
             all.retain(|r| !on.contains(r));
+            all.extend(refs(d.get("OFF"), doc));
             all
         } else {
             refs(d.get("OFF"), doc)
@@ -107,9 +116,10 @@ impl LayerFilter {
         filter
     }
 
-    /// Whether the filter turns off no group at all.
+    /// Whether the filter can hide nothing: no group is off and the
+    /// document has no optional content to evaluate.
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.off.is_empty()
+        self.names.is_empty() && self.off.is_empty() && !self.evaluates_oc
     }
 
     /// Whether the group behind `group_ref` is off by reference alone (the

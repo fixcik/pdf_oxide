@@ -298,7 +298,8 @@ pub fn check_oc_excluded<S: OcGroupState + ?Sized>(
 }
 
 /// Result of a `/VE` visibility expression. `Malformed` (nesting deeper
-/// than [`VE_MAX_DEPTH`], e.g. a reference cycle) propagates through every
+/// than [`VE_MAX_DEPTH`], e.g. a reference cycle, or more than
+/// [`VE_MAX_NODES`] nodes, e.g. a DAG of shared references) propagates through every
 /// operator — `/Not` included — and hides the scope: a structure no viewer
 /// can be relied on to evaluate must not reveal what it guards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +313,11 @@ enum Ve {
 /// at 50.
 const VE_MAX_DEPTH: u8 = 64;
 
+/// Node budget of one `/VE` evaluation. Shared references make a DAG that a
+/// tree walk visits exponentially often; past the budget the expression is
+/// `Malformed` (hidden), so a hostile file cannot stall the extractor.
+const VE_MAX_NODES: u32 = 4096;
+
 /// Evaluate an OCMD `/VE` visibility expression (ISO 32000-1 §8.11.2.4): an
 /// array of an operator (`/And`, `/Or`, `/Not`) and operands, each a group
 /// reference or a nested expression.
@@ -320,10 +326,17 @@ fn evaluate_visibility_expression<S: OcGroupState + ?Sized>(
     doc: &PdfDocument,
     excluded: &S,
 ) -> Ve {
-    fn eval<S: OcGroupState + ?Sized>(expr: &Object, doc: &PdfDocument, ex: &S, depth: u8) -> Ve {
-        if depth > VE_MAX_DEPTH {
+    fn eval<S: OcGroupState + ?Sized>(
+        expr: &Object,
+        doc: &PdfDocument,
+        ex: &S,
+        depth: u8,
+        budget: &mut u32,
+    ) -> Ve {
+        if depth > VE_MAX_DEPTH || *budget == 0 {
             return Ve::Malformed;
         }
+        *budget -= 1;
         let group_ref = expr.as_reference();
         let resolved = match group_ref {
             Some(r) => doc.load_object(r).unwrap_or_else(|_| expr.clone()),
@@ -343,16 +356,21 @@ fn evaluate_visibility_expression<S: OcGroupState + ?Sized>(
         let Some(op) = arr.first().and_then(|o| o.as_name()) else {
             return Ve::Visible;
         };
-        let mut operands = arr[1..].iter().map(|o| eval(o, doc, ex, depth + 1));
         match op {
-            "Not" => match operands.next().unwrap_or(Ve::Visible) {
+            "Not" => match arr
+                .get(1)
+                .map_or(Ve::Visible, |o| eval(o, doc, ex, depth + 1, budget))
+            {
                 Ve::Visible => Ve::Hidden,
                 Ve::Hidden => Ve::Visible,
                 Ve::Malformed => Ve::Malformed,
             },
             "And" | "Or" => {
                 // Evaluate every operand: a malformed one anywhere decides.
-                let all: Vec<Ve> = operands.collect();
+                let all: Vec<Ve> = arr[1..]
+                    .iter()
+                    .map(|o| eval(o, doc, ex, depth + 1, budget))
+                    .collect();
                 if all.contains(&Ve::Malformed) {
                     Ve::Malformed
                 } else if (op == "And" && all.iter().all(|v| *v == Ve::Visible))
@@ -367,7 +385,8 @@ fn evaluate_visibility_expression<S: OcGroupState + ?Sized>(
         }
     }
 
-    eval(expr, doc, excluded, 0)
+    let mut budget = VE_MAX_NODES;
+    eval(expr, doc, excluded, 0, &mut budget)
 }
 
 /// Resolve BDC properties and decide if the resulting scope is excluded.

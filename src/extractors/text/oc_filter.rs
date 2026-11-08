@@ -75,17 +75,18 @@ impl<'doc> TextExtractor<'doc> {
     /// A `Do` inside an excluded layer draws nothing (§8.11.3.2), so it must
     /// neither be expanded nor be recorded as processed: the dedup guard of
     /// (form, CTM) would otherwise skip a later, visible draw of the same
-    /// form at the same CTM.
+    /// form at the same CTM. An image drawn there is not recorded as a paint
+    /// either (it is not drawn).
     pub(super) fn do_is_in_excluded_layer(&self) -> bool {
         self.inside_excluded_layer
     }
 
     /// Whether `content_stream` must take the full parser although no
-    /// emission filter is set: when the document's default configuration
-    /// hides layers, a filtered and an unfiltered extraction of the same page
-    /// must see the same text state, and the >256 KB prescan route loses the
-    /// text state set outside `BT` (`TL`, `Tc`, `Tz`, …). Documents without
-    /// default-off layers keep the prescan.
+    /// emission filter is set: when the document has optional content (its
+    /// default filter is not empty), a filtered and an unfiltered extraction
+    /// of the same page must see the same text state, and the >256 KB prescan
+    /// route loses the text state set outside `BT` (`TL`, `Tc`, `Tz`, …).
+    /// Documents without optional content keep the prescan.
     pub(super) fn full_parse_for_layers(&mut self, content_stream: &[u8]) -> bool {
         if content_stream.len() <= PRESCAN_THRESHOLD {
             return false;

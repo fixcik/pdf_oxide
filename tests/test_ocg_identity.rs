@@ -151,7 +151,45 @@ fn base_state_off_with_every_group_on_hides_nothing() {
         TWO_RUNS,
         &["<< /Type /OCG /Name (A) >>", "<< /Type /OCG /Name (B) >>"],
     ));
-    assert!(LayerFilter::document_default(&doc).is_empty());
+    let text = shown(&doc);
+    assert!(text.contains("PAYLOAD") && text.contains("HONEST"), "{text}");
+}
+
+#[test]
+fn base_state_off_applies_off_after_on_as_viewers_do() {
+    // Group 6 is in /ON and /OFF: poppler and pdf.js apply /OFF last.
+    let doc = open(pdf(
+        "/OCProperties << /OCGs [6 0 R 7 0 R] \
+         /D << /BaseState /OFF /ON [6 0 R 7 0 R] /OFF [6 0 R] >> >>",
+        AB,
+        TWO_RUNS,
+        &["<< /Type /OCG /Name (A) >>", "<< /Type /OCG /Name (B) >>"],
+    ));
+    let text = shown(&doc);
+    assert!(!text.contains("PAYLOAD"), "{text}");
+    assert!(text.contains("HONEST"), "{text}");
+}
+
+/// No group is off; `/a` is the OCMD `ocmd` over the on group 7.
+fn ocmd_over_on_groups(ocmd: &str) -> PdfDocument {
+    open(pdf(
+        "/OCProperties << /OCGs [7 0 R] /D << /Order [7 0 R] >> >>",
+        "/Properties << /a 6 0 R /b 7 0 R >>",
+        TWO_RUNS,
+        &[ocmd, "<< /Type /OCG /Name (On) >>"],
+    ))
+}
+
+#[test]
+fn an_ocmd_over_groups_that_are_on_hides_its_content_without_any_off_group() {
+    for ocmd in [
+        "<< /Type /OCMD /OCGs [7 0 R] /VE [/Not 7 0 R] >>",
+        "<< /Type /OCMD /OCGs [7 0 R] /P /AnyOff >>",
+    ] {
+        let text = shown(&ocmd_over_on_groups(ocmd));
+        assert!(!text.contains("PAYLOAD"), "{ocmd}: {text}");
+        assert!(text.contains("HONEST"), "{ocmd}: {text}");
+    }
 }
 
 #[test]
@@ -367,4 +405,37 @@ fn a_hidden_run_inside_a_visible_text_object_is_cut_from_the_filtered_page() {
     assert!(full.iter().any(|t| t.contains("PWNED")), "{full:?}");
     assert!(shown.iter().all(|t| !t.contains("PWNED")), "{shown:?}");
     assert!(shown.iter().any(|t| t.contains("Total")), "{shown:?}");
+}
+
+#[test]
+fn a_malformed_operand_decides_an_or_with_a_visible_sibling() {
+    // [/Or <70 levels> on-group]: the well-formed sibling is visible, but a
+    // malformed operand anywhere hides the scope.
+    let ve = format!("[/Or {} 7 0 R]", nested("Or", 70, "7 0 R"));
+    let text = shown(&ve_doc(&ve, &[]));
+    assert!(!text.contains("HONEST"), "{text}");
+}
+
+#[test]
+fn a_shared_reference_dag_in_a_visibility_expression_is_bounded() {
+    // Object 9 + k is `[/And 10+k 0 R 10+k 0 R]` for k < 64, ending at the on
+    // group 7: a tree walk would visit 2^64 nodes.
+    let levels: Vec<String> = (0..64)
+        .map(|k| {
+            let next = if k == 63 {
+                "7 0 R".to_string()
+            } else {
+                format!("{} 0 R", 10 + k)
+            };
+            format!("[/And {next} {next}]")
+        })
+        .collect();
+    let refs: Vec<&str> = levels.iter().map(String::as_str).collect();
+    let start = std::time::Instant::now();
+    let text = shown(&ve_doc("9 0 R", &refs));
+    let took = start.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    // Past the node budget the expression is malformed: hidden.
+    assert!(!text.contains("HONEST"), "{text}");
+    assert!(!text.contains("PAYLOAD"), "{text}");
 }
