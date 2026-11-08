@@ -644,7 +644,7 @@ impl PageRenderer {
         }
 
         // Get page content stream
-        let content_data = doc.get_page_content_data(page_num)?;
+        let content_data = doc.cached_page_content(page_num)?;
 
         // Parse content stream
         let operators = match parse_content_stream(&content_data) {
@@ -4617,8 +4617,9 @@ impl PageRenderer {
             Some(&color_space_map),
             target,
         )?;
-        let dynamic_image = pdf_image.to_dynamic_image()?;
-        let mut rgba_image = dynamic_image.to_rgba8();
+        // Consumed: an already-RGBA decode is reused and the decoded buffer is not kept alive
+        // next to its RGBA copy (a 300-dpi scan is tens of MB per copy).
+        let mut rgba_image = pdf_image.to_dynamic_image()?.into_rgba8();
 
         // Handle /Mask (stencil mask image) — PDF spec section 8.9.6.2
         // The mask is a separate image whose samples define opacity (1=opaque, 0=transparent)
@@ -4976,7 +4977,7 @@ impl PageRenderer {
         let (blit_w, blit_h, blit_data, blit_transform) = if use_fast {
             let dst_w = ((image_transform.sx * src_w as f32).round() as u32).max(1);
             let dst_h = ((image_transform.sy * src_h as f32).round() as u32).max(1);
-            let resized = resize_rgba(&rgba_raw, src_w, src_h, dst_w, dst_h);
+            let resized = resize_rgba(&mut rgba_raw, src_w, src_h, dst_w, dst_h);
             if let Some(pixels) = resized {
                 // SIMD pre-resize produced the exact output dimensions —
                 // the subsequent blit is 1:1, so override to Nearest to
@@ -10735,14 +10736,14 @@ fn parse_ext_g_state(
 ///
 /// Returns `None` on failure (zero dimensions, SIMD dispatch error) so callers
 /// can fall back to tiny_skia's own resampling path.
-fn resize_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Option<Vec<u8>> {
+fn resize_rgba(src: &mut [u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Option<Vec<u8>> {
     use fast_image_resize::images::Image;
     use fast_image_resize::pixels::PixelType;
     use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 
-    // from_slice_u8 needs a mutable slice; copy into a local buffer.
-    let mut buf = src.to_vec();
-    let src_img = Image::from_slice_u8(src_w, src_h, &mut buf, PixelType::U8x4).ok()?;
+    // `from_slice_u8` wants a mutable slice but the resize only reads it: the caller's buffer is
+    // used in place (no copy of a possibly tens-of-MB raster).
+    let src_img = Image::from_slice_u8(src_w, src_h, src, PixelType::U8x4).ok()?;
     let mut dst_img = Image::new(dst_w, dst_h, PixelType::U8x4);
     Resizer::new()
         .resize(

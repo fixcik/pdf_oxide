@@ -85,6 +85,14 @@ impl<K: Eq + std::hash::Hash + Copy, V> BoundedEntryCache<K, V> {
         self.insertion_order.clear();
     }
 
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        let v = self.map.remove(key)?;
+        if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
+            self.insertion_order.remove(pos);
+        }
+        Some(v)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }

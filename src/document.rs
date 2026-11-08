@@ -92,6 +92,14 @@ const DEFAULT_OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum number of entries for the XObject span/image caches.
 const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// Entries of the per-page caches (spans, raw spans, chars, words, paths): twice the pages that
+/// can be in flight at once, so a page processed in parallel with the others is still cached by
+/// the time its next extraction asks for it (with 8 entries on 18 threads every call recomputed).
+/// A caller that is done with a page can `forget_page` it to keep the caches at the in-flight set.
+fn page_cache_entries() -> usize {
+    std::thread::available_parallelism().map_or(8, |n| (2 * n.get()).max(8))
+}
+
 /// Heuristic multiplier for the forward-gap guard in the main
 /// assembly loop's compound newline predicate
 /// (`y_diff > 2.0 && gap > K * max(fs)`). Visual gap-sweep over
@@ -586,6 +594,15 @@ pub struct PdfDocument {
     /// so without this every span extraction re-parses the content stream a
     /// second time purely to stamp per-glyph x-origins.
     page_chars_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextChar>>>>,
+    /// Per-page cache of the default `extract_words` result (no threshold, no
+    /// profile, artifacts included). `classify_page` and a table pass both
+    /// ask for the same words; this serves the repeat from one clustering.
+    /// Cleared together with `page_spans_cache` (words derive from spans).
+    page_words_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::Word>>>>,
+    /// Per-page cache of `extract_paths`: a pure function of the page content,
+    /// asked for by `classify_page` and by path consumers of the same page.
+    page_paths_cache:
+        Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::elements::PathContent>>>>,
     /// Cached signatures of running headers/footers detected via cross-page
     /// repetition. A span whose normalized text matches a signature
     /// sits near the top/bottom of the page is treated as an artifact.
@@ -1342,8 +1359,8 @@ impl PdfDocument {
             )),
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
-            page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
-            page_raw_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
+            page_spans_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
+            page_raw_spans_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
             signatures_compute_lock: Mutex::new(()),
             struct_tree_compute_lock: Mutex::new(()),
             refine_char_x_offsets: std::sync::atomic::AtomicBool::new(true),
@@ -1352,7 +1369,9 @@ impl PdfDocument {
             raw_paints: Mutex::new(HashMap::new()),
             xobject_paint_meta: Mutex::new(HashMap::new()),
             search_index: Mutex::new(HashMap::new()),
-            page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
+            page_chars_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
+            page_words_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
+            page_paths_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
             running_artifact_signatures: Mutex::new(None),
             article_threads_cache: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
@@ -1864,12 +1883,14 @@ impl PdfDocument {
         // guard) that `extract_text` relies on — reuse its output here
         // instead of re-deriving word boundaries from span punctuation.
         let word_text: String = self
-            .extract_words(page)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|w| w.text)
-            .collect::<Vec<_>>()
-            .join(" ");
+            .extract_words_shared(page)
+            .map(|ws| {
+                ws.iter()
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
         let words: Vec<&str> = word_text.split_whitespace().collect();
         let (fragmented_word_ratio, consecutive_repeat_ratio) = if words.is_empty() {
             (0.0, 0.0)
@@ -1919,7 +1940,7 @@ impl PdfDocument {
         // ── content-stream ops: Tr-mode-3 ratio (cases C/C2) ──
         let mut invisible = 0usize;
         let mut glyph_bytes = 0usize;
-        if let Ok(data) = self.get_page_content_data(page) {
+        if let Ok(data) = self.cached_page_content(page) {
             if let Ok(ops) = crate::content::parse_content_stream(&data) {
                 let mut rm: u8 = 0;
                 let mut stack: Vec<u8> = Vec::new();
@@ -1963,7 +1984,10 @@ impl PdfDocument {
         };
 
         // ── vector path density (case F) ──
-        let path_count = self.extract_paths(page).map(|p| p.len()).unwrap_or(0);
+        let path_count = self
+            .extract_paths_shared(page)
+            .map(|p| p.len())
+            .unwrap_or(0);
         let vector_path_density = {
             let denom = (path_count + glyphs + images.len()).max(1) as f32;
             (path_count as f32 / denom).clamp(0.0, 1.0)
@@ -6200,7 +6224,7 @@ impl PdfDocument {
                 true
             } else {
                 // Also check content stream for BT/Do operators (SIMD-fast scan).
-                match self.get_page_content_data(page_index) {
+                match self.cached_page_content(page_index) {
                     Ok(ref content_data) => !Self::may_contain_text(content_data),
                     Err(_) => false, // Can't read content stream — be conservative
                 }
@@ -7470,6 +7494,7 @@ impl PdfDocument {
     pub fn set_char_x_offset_refinement(&self, enabled: bool) {
         self.refine_char_x_offsets.store(enabled, Ordering::Relaxed);
         self.page_spans_cache.lock_or_recover().clear();
+        self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
     }
 
@@ -7492,6 +7517,7 @@ impl PdfDocument {
         self.visibility_facts.store(enabled, Ordering::Relaxed);
         self.page_spans_cache.lock_or_recover().clear();
         self.page_raw_spans_cache.lock_or_recover().clear();
+        self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         self.page_visibility.lock_or_recover().clear();
         self.raw_paints.lock_or_recover().clear();
@@ -7527,6 +7553,7 @@ impl PdfDocument {
         // Redaction changes a page's spans; drop the span cache.
         self.page_spans_cache.lock_or_recover().clear();
         self.page_raw_spans_cache.lock_or_recover().clear();
+        self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         Ok(())
     }
@@ -7536,8 +7563,22 @@ impl PdfDocument {
         self.erase_regions.lock_or_recover().remove(&page_index);
         self.page_spans_cache.lock_or_recover().clear();
         self.page_raw_spans_cache.lock_or_recover().clear();
+        self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         Ok(())
+    }
+
+    /// Drops the per-page cache entries (content, spans, raw spans, chars, words, paths) of
+    /// `page_index`. For a caller that extracts page after page and is done with this one: the
+    /// caches then hold only the pages still in flight. Results are unaffected; a later call for
+    /// the page extracts again.
+    pub fn forget_page(&self, page_index: usize) {
+        self.page_content_cache.lock_or_recover().remove(&page_index);
+        self.page_spans_cache.lock_or_recover().remove(&page_index);
+        self.page_raw_spans_cache.lock_or_recover().remove(&page_index);
+        self.page_chars_cache.lock_or_recover().remove(&page_index);
+        self.page_words_cache.lock_or_recover().remove(&page_index);
+        self.page_paths_cache.lock_or_recover().remove(&page_index);
     }
 
     /// Identify and remove headers.
@@ -11192,7 +11233,7 @@ impl PdfDocument {
         // Probe content stream for text-showing operators. If we can't
         // read the content stream, be conservative and say yes (let
         // extraction try).
-        match self.get_page_content_data(page_index) {
+        match self.cached_page_content(page_index) {
             Ok(content_data) => Ok(Self::may_contain_text(&content_data)),
             Err(_) => Ok(true),
         }
@@ -12767,14 +12808,23 @@ impl PdfDocument {
     pub fn extract_spans(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
         // Serve repeat per-page extractions from cache (the converters reach
         // here twice per page; see `page_spans_cache`).
+        Ok((*self.extract_spans_shared(page_index)?).clone())
+    }
+
+    /// [`Self::extract_spans`] without the clone: the cached, shared span list
+    /// of the page.
+    pub fn extract_spans_shared(
+        &self,
+        page_index: usize,
+    ) -> Result<std::sync::Arc<Vec<crate::layout::TextSpan>>> {
         if let Some(cached) = self.page_spans_cache.lock_or_recover().get(&page_index) {
-            return Ok((**cached).clone());
+            return Ok(std::sync::Arc::clone(cached));
         }
         let spans = self.extract_spans_raw(page_index)?;
-        let spans = self.postprocess_spans(page_index, spans)?;
+        let spans = std::sync::Arc::new(self.postprocess_spans(page_index, spans)?);
         self.page_spans_cache
             .lock_or_recover()
-            .insert(page_index, std::sync::Arc::new(spans.clone()));
+            .insert(page_index, std::sync::Arc::clone(&spans));
         Ok(spans)
     }
 
@@ -17409,7 +17459,7 @@ impl PdfDocument {
             return Ok(Vec::new());
         }
 
-        let content_data = match self.get_page_content_data(page_index) {
+        let content_data = match self.cached_page_content(page_index) {
             Ok(data) => data,
             Err(e) => {
                 log::warn!(
@@ -17964,7 +18014,7 @@ impl PdfDocument {
         }
 
         // Get content stream data — skip page on decode failure (Annex I)
-        let content_data = match self.get_page_content_data(page_index) {
+        let content_data = match self.cached_page_content(page_index) {
             Ok(data) => data,
             Err(e) => {
                 log::warn!(
@@ -18205,7 +18255,7 @@ impl PdfDocument {
     /// surfacing their inks here would create plates that stay empty.
     pub fn get_page_inks_deep(&self, page_index: usize) -> Result<Vec<String>> {
         let resources = self.page_resources_for_inks(page_index)?;
-        let content_data = self.get_page_content_data(page_index)?;
+        let content_data = self.cached_page_content(page_index)?;
         let operators = crate::content::parser::parse_content_stream(&content_data)?;
 
         let mut ink_names: Vec<String> = Vec::new();
@@ -18386,6 +18436,15 @@ impl PdfDocument {
         Ok((*self.cached_page_chars(page_index)?).clone())
     }
 
+    /// [`Self::extract_chars`] without the clone: the cached, shared character
+    /// sequence of the page.
+    pub fn extract_chars_shared(
+        &self,
+        page_index: usize,
+    ) -> Result<std::sync::Arc<Vec<crate::layout::TextChar>>> {
+        self.cached_page_chars(page_index)
+    }
+
     /// Shared, cached character sequence for a page — identical to what
     /// [`Self::extract_chars`] returns, minus the clone. Only the unfiltered
     /// extraction is cached; the layer/ink-filtered variant is keyed on its
@@ -18438,7 +18497,7 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        let content_data = match self.get_page_content_data(page_index) {
+        let content_data = match self.cached_page_content(page_index) {
             Ok(data) => data,
             Err(e) => {
                 log::warn!(
@@ -18509,7 +18568,24 @@ impl PdfDocument {
     /// }
     /// ```
     pub fn extract_words(&self, page_index: usize) -> Result<Vec<crate::layout::Word>> {
-        self.extract_words_with_thresholds(page_index, None, None)
+        Ok((*self.extract_words_shared(page_index)?).clone())
+    }
+
+    /// [`Self::extract_words`] without the clone: the cached, shared word list
+    /// of the page (default thresholds, artifacts included). Repeat calls for
+    /// the same page serve the first clustering instead of redoing it.
+    pub fn extract_words_shared(
+        &self,
+        page_index: usize,
+    ) -> Result<std::sync::Arc<Vec<crate::layout::Word>>> {
+        if let Some(cached) = self.page_words_cache.lock_or_recover().get(&page_index) {
+            return Ok(std::sync::Arc::clone(cached));
+        }
+        let words = std::sync::Arc::new(self.extract_words_inner(page_index, None, None, true)?.0);
+        self.page_words_cache
+            .lock_or_recover()
+            .insert(page_index, std::sync::Arc::clone(&words));
+        Ok(words)
     }
 
     /// Extract words from a page with optional threshold and profile overrides.
@@ -18663,16 +18739,28 @@ impl PdfDocument {
         // must not re-decide a join the merger already made from per-glyph
         // advance evidence.
         let mut continues_prev: Vec<bool> = Vec::new();
+        // Group characters within EACH SPAN. Since PDF spans are often words or line fragments,
+        // this is much safer than global character clustering. Clustered up front so the chars can
+        // then be moved into their words instead of cloned (the clusters partition each span).
+        let span_clusters: Vec<Vec<Vec<usize>>> = span_char_ranges
+            .iter()
+            .map(|r| {
+                let span_chars = &all_chars[r.clone()];
+                if span_chars.is_empty() {
+                    Vec::new()
+                } else {
+                    clustering::cluster_chars_into_words(span_chars, params.word_gap_threshold)
+                }
+            })
+            .collect();
+        let mut all_chars: Vec<Option<crate::layout::TextChar>> =
+            all_chars.into_iter().map(Some).collect();
         for (span_idx, span) in spans.iter().enumerate() {
-            let span_chars = &all_chars[span_char_ranges[span_idx].clone()];
+            let span_chars = &mut all_chars[span_char_ranges[span_idx].clone()];
             if span_chars.is_empty() {
                 continue;
             }
-
-            // Group characters within THIS SPAN. Since PDF spans are often words or line fragments,
-            // this is much safer than global character clustering.
-            let clusters =
-                clustering::cluster_chars_into_words(span_chars, params.word_gap_threshold);
+            let clusters = &span_clusters[span_idx];
 
             // Record split boundary: the first word created from this span is a hard
             // boundary when split_boundary_before = true (e.g. table cell boundary).
@@ -18690,8 +18778,12 @@ impl PdfDocument {
                 let mut current_word_chars = Vec::new();
                 let mut src_lo = usize::MAX;
                 let mut src_hi = 0usize;
-                for &ci in &cluster_indices {
-                    let c = span_chars[ci].clone();
+                for &ci in cluster_indices {
+                    // The clusters partition the span's chars (each index once), so the char is
+                    // moved out instead of cloned; `None` only for a repeated index.
+                    let Some(c) = span_chars[ci].take() else {
+                        continue;
+                    };
                     if c.char.is_whitespace() || c.char == '\n' || c.char == '\r' {
                         if !current_word_chars.is_empty() {
                             let mut word =
@@ -19356,12 +19448,21 @@ impl PdfDocument {
         Ok((*self.cached_page_content(page_index)?).clone())
     }
 
+    /// [`Self::get_page_content_data`] without the copy: the cached, shared
+    /// decoded content stream of the page.
+    pub fn get_page_content_data_shared(
+        &self,
+        page_index: usize,
+    ) -> Result<std::sync::Arc<Vec<u8>>> {
+        self.cached_page_content(page_index)
+    }
+
     /// Shared, cached content-stream bytes for a page — the same data
     /// [`Self::get_page_content_data`] returns, minus the copy. Extraction
     /// only ever reads the bytes, and a single `extract_words` page touches
     /// this twice (once for spans, once for chars), so handing back the `Arc`
     /// avoids copying the decompressed stream on every call.
-    fn cached_page_content(&self, page_index: usize) -> Result<std::sync::Arc<Vec<u8>>> {
+    pub(crate) fn cached_page_content(&self, page_index: usize) -> Result<std::sync::Arc<Vec<u8>>> {
         {
             let mut cache = self.page_content_cache.lock_or_recover();
             if let Some(data) = cache.get(&page_index) {
@@ -19636,6 +19737,30 @@ impl PdfDocument {
     /// # }
     /// ```
     pub fn extract_paths(&self, page_index: usize) -> Result<Vec<crate::elements::PathContent>> {
+        Ok((*self.extract_paths_shared(page_index)?).clone())
+    }
+
+    /// [`Self::extract_paths`] without the clone: the cached, shared path list
+    /// of the page. The paths are a pure function of the page content, so
+    /// repeat calls for the same page serve the first extraction.
+    pub fn extract_paths_shared(
+        &self,
+        page_index: usize,
+    ) -> Result<std::sync::Arc<Vec<crate::elements::PathContent>>> {
+        if let Some(cached) = self.page_paths_cache.lock_or_recover().get(&page_index) {
+            return Ok(std::sync::Arc::clone(cached));
+        }
+        let paths = std::sync::Arc::new(self.extract_paths_uncached(page_index)?);
+        self.page_paths_cache
+            .lock_or_recover()
+            .insert(page_index, std::sync::Arc::clone(&paths));
+        Ok(paths)
+    }
+
+    fn extract_paths_uncached(
+        &self,
+        page_index: usize,
+    ) -> Result<Vec<crate::elements::PathContent>> {
         use crate::content::{parse_content_stream_paths_only, Operator};
         use crate::elements::{LineCap, LineJoin};
         use crate::extractors::paths::{FillRule, PathExtractor, PathGraphicsStateStack};
@@ -19649,7 +19774,7 @@ impl PdfDocument {
         })?;
 
         // Get content stream data — skip page on decode failure (Annex I)
-        let content_data = match self.get_page_content_data(page_index) {
+        let content_data = match self.cached_page_content(page_index) {
             Ok(data) => data,
             Err(e) => {
                 log::warn!(
@@ -24150,7 +24275,7 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        let content_data = self.get_page_content_data(page_index)?;
+        let content_data = self.cached_page_content(page_index)?;
 
         let resources = match page_dict.get("Resources") {
             Some(res) => {
@@ -24539,7 +24664,7 @@ impl PdfDocument {
         })?;
 
         // Get content stream
-        let content_data = self.get_page_content_data(page_index)?;
+        let content_data = self.cached_page_content(page_index)?;
 
         // Resolve resources
         let resources = match page_dict.get("Resources") {
