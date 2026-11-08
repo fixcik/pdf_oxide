@@ -62,6 +62,7 @@ pub enum ReadingOrder {
 
 #[cfg(test)]
 mod concurrency_tests;
+mod font_sets;
 mod pdf_reader;
 use pdf_reader::PdfReader;
 
@@ -21692,15 +21693,9 @@ impl PdfDocument {
                     // Hash mismatch: fonts differ — fall through to full load.
                 }
 
-                // Snapshot names already in the extractor before this load_fonts call.
-                // Layer 4 must store only the delta so that a cache hit never injects
-                // parent-page fonts into a different page's extractor context, which
-                // would overwrite correctly-loaded fonts with wrong versions.
-                let extractor_names_before: std::collections::HashSet<String> = extractor
-                    .get_font_set()
-                    .into_iter()
-                    .map(|(k, _)| k)
-                    .collect();
+                // Names of this dict whose font failed to load: the caches must
+                // not store the caller's font under them (see `font_sets`).
+                let mut failed: Vec<&str> = Vec::new();
 
                 let mut all_from_cache = true;
 
@@ -21791,6 +21786,7 @@ impl PdfDocument {
                                     name,
                                     e
                                 );
+                                failed.push(name.as_str());
                                 continue;
                             },
                         }
@@ -21808,6 +21804,7 @@ impl PdfDocument {
                                     name,
                                     e
                                 );
+                                failed.push(name.as_str());
                                 continue;
                             },
                         }
@@ -21822,8 +21819,8 @@ impl PdfDocument {
                 // again even when all fonts came from cache.
                 extractor.share_truetype_cmaps();
 
-                // Cache font set by both ObjectRef and fingerprint
-                let font_set = extractor.get_font_set();
+                // Cache this dict's own fonts by both ObjectRef and fingerprint
+                let font_set = font_sets::own_fonts(extractor.get_font_set(), font_dict, &failed);
                 if let Some(fdr) = font_dict_ref {
                     self.font_set_cache
                         .lock_or_recover()
@@ -21833,9 +21830,8 @@ impl PdfDocument {
                     .lock_or_recover()
                     .insert(fingerprint, font_set.clone());
 
-                // Cache by font names for Layer 4. Store only the delta — fonts
-                // added by THIS load_fonts call — so that a cache hit never pollutes
-                // a different page's extractor with stale parent-page fonts.
+                // Cache by font names for Layer 4: the same own fonts, so a cache
+                // hit never pollutes a different page's extractor with parent fonts.
                 // The combined identity hash covers ALL reference fonts (sorted by
                 // name), so a hit requires every font in the Resources dict to match,
                 // not just one. This prevents false positives when pages reuse the
@@ -21854,14 +21850,9 @@ impl PdfDocument {
                         }
                         h.finish()
                     };
-                    let l4_set: Vec<(String, Arc<FontInfo>)> = font_set
-                        .iter()
-                        .filter(|(k, _)| !extractor_names_before.contains(k.as_str()))
-                        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                        .collect();
                     self.font_name_set_cache
                         .lock_or_recover()
-                        .insert(name_hash, (Arc::new(l4_set), combined_check_hash));
+                        .insert(name_hash, (Arc::new(font_set), combined_check_hash));
                 }
 
                 return Ok(());
