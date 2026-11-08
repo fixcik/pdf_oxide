@@ -365,6 +365,14 @@ struct RunningArtifactSignature {
     occurrences: Vec<(usize, crate::geometry::Rect)>,
 }
 
+/// What the running header/footer scan keeps of one page (see
+/// `PdfDocument::scan_page`): text outside the chrome band(s), and each band
+/// span's (signature, box, trimmed text) in span order.
+struct ScanPage {
+    body: bool,
+    band: Vec<(String, crate::geometry::Rect, String)>,
+}
+
 mod turned_runs;
 
 /// PDF document.
@@ -17054,6 +17062,107 @@ impl PdfDocument {
     fn ensure_running_artifact_signatures(
         &self,
     ) -> Result<std::sync::Arc<std::collections::HashMap<String, RunningArtifactSignature>>> {
+        // In parallel only off the rayon pools: on a worker, a nested pool
+        // wait could steal an outer task that re-enters here (see
+        // `scan_running_artifacts_on_current_pool` for callers that know
+        // their pool holds no such task).
+        #[cfg(feature = "parallel")]
+        let scan_threads = if rayon::current_thread_index().is_none() {
+            rayon::current_num_threads()
+        } else {
+            1
+        };
+        #[cfg(not(feature = "parallel"))]
+        let scan_threads = 1;
+        self.running_artifact_signatures_scanned_by(scan_threads)
+    }
+
+    /// Runs the running header/footer scan of the document now (once per
+    /// document; later calls return at once), with its page extractions
+    /// spread over at most `threads` tasks of the CURRENT rayon pool — also
+    /// when called from one of that pool's workers, unlike the lazy scan
+    /// that a page extraction starts, which stays on the calling thread
+    /// there.
+    ///
+    /// The result is what the lazy scan computes: the per-page work is
+    /// independent and the pages are aggregated in page order.
+    ///
+    /// Precondition: while this runs, no task queued on the current pool may
+    /// extract pages of THIS document. A waiting worker of the pool runs
+    /// queued tasks, and such a task would reach the scan's lock, which the
+    /// waiting thread already holds. Call it before handing the document's
+    /// pages to the pool (tasks for other documents are fine).
+    #[cfg(feature = "parallel")]
+    pub fn scan_running_artifacts_on_current_pool(&self, threads: usize) -> Result<()> {
+        self.running_artifact_signatures_scanned_by(threads.max(1))
+            .map(|_| ())
+    }
+
+    /// The scanned page of the running header/footer scan: whether the page
+    /// has text outside the chrome band(s) (otherwise a page that is only a
+    /// title near the top would make that title a "running header" on every
+    /// page), and every band span's signature, box and trimmed text, in span
+    /// order. `None` when the page's spans or media box cannot be read.
+    fn scan_page(&self, pi: usize) -> Option<ScanPage> {
+        let spans = self.extract_spans_for_scan(pi).ok()?;
+        let (page_width, page_height) = match self.get_page_media_box(pi) {
+            Ok((_, _, w, h)) if h > 0.0 => (w, h),
+            _ => return None,
+        };
+        let vertical = Self::page_is_vertical(&spans);
+        let body = spans.iter().any(|s| {
+            !s.text.trim().is_empty()
+                && !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
+        });
+        let band = spans
+            .iter()
+            .filter_map(|s| {
+                let trimmed = s.text.trim();
+                if trimmed.is_empty()
+                    || !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
+                {
+                    return None;
+                }
+                let sig = Self::normalize_artifact_signature(trimmed);
+                if sig.is_empty() || sig.chars().count() < 2 {
+                    return None;
+                }
+                Some((sig, s.bbox, trimmed.to_string()))
+            })
+            .collect();
+        Some(ScanPage { body, band })
+    }
+
+    /// [`Self::scan_page`] of every page on at most `threads` tasks of the
+    /// current rayon pool, each taking the next page from a shared counter;
+    /// back in page order.
+    #[cfg(feature = "parallel")]
+    fn scan_pages_parallel(&self, page_count: usize, threads: usize) -> Vec<Option<ScanPage>> {
+        use rayon::prelude::*;
+        let next = AtomicUsize::new(0);
+        let mut pages: Vec<(usize, Option<ScanPage>)> = (0..threads.min(page_count))
+            .into_par_iter()
+            .with_max_len(1)
+            .flat_map_iter(|_| {
+                let mut out = Vec::new();
+                loop {
+                    let pi = next.fetch_add(1, Ordering::Relaxed);
+                    if pi >= page_count {
+                        break;
+                    }
+                    out.push((pi, self.scan_page(pi)));
+                }
+                out
+            })
+            .collect();
+        pages.sort_unstable_by_key(|&(pi, _)| pi);
+        pages.into_iter().map(|(_, page)| page).collect()
+    }
+
+    fn running_artifact_signatures_scanned_by(
+        &self,
+        scan_threads: usize,
+    ) -> Result<std::sync::Arc<std::collections::HashMap<String, RunningArtifactSignature>>> {
         {
             let guard = self.running_artifact_signatures.lock_or_recover();
             if let Some(ref map) = *guard {
@@ -17104,99 +17213,57 @@ impl PdfDocument {
             String,
             Vec<(usize, crate::geometry::Rect, String)>,
         > = std::collections::HashMap::new();
-        // Page scan: the per-page extraction is independent, so (when not
-        // already running on a rayon worker, where a nested pool wait could
-        // steal an outer task that re-enters here) fetch it in parallel in
-        // bounded chunks; the aggregation below stays sequential.
-        let fetch = |pi: usize| -> Option<(Vec<crate::layout::TextSpan>, f32, f32)> {
-            let spans = self.extract_spans_for_scan(pi).ok()?;
-            match self.get_page_media_box(pi) {
-                Ok((_, _, w, h)) if h > 0.0 => Some((spans, w, h)),
-                _ => None,
+        // Page scan: the per-page extraction is independent, so it may run in
+        // parallel (`scan_threads > 1`); each page is reduced to its
+        // `ScanPage` on the spot and the aggregation below stays sequential,
+        // in page order.
+        let pages: Vec<Option<ScanPage>> = if scan_threads > 1 {
+            #[cfg(feature = "parallel")]
+            {
+                self.scan_pages_parallel(page_count, scan_threads)
             }
+            #[cfg(not(feature = "parallel"))]
+            {
+                (0..page_count).map(|pi| self.scan_page(pi)).collect()
+            }
+        } else {
+            (0..page_count).map(|pi| self.scan_page(pi)).collect()
         };
-        const SCAN_CHUNK: usize = 32;
-        #[cfg(feature = "parallel")]
-        let parallel_scan = rayon::current_thread_index().is_none();
-        #[cfg(not(feature = "parallel"))]
-        let parallel_scan = false;
-        let mut chunk_start = 0;
-        while chunk_start < page_count {
-            let chunk_end = (chunk_start + SCAN_CHUNK).min(page_count);
-            let pre: Vec<Option<(Vec<crate::layout::TextSpan>, f32, f32)>> = if parallel_scan {
-                #[cfg(feature = "parallel")]
-                {
-                    use rayon::prelude::*;
-                    (chunk_start..chunk_end)
-                        .into_par_iter()
-                        .map(fetch)
-                        .collect()
-                }
-                #[cfg(not(feature = "parallel"))]
-                {
-                    (chunk_start..chunk_end).map(fetch).collect()
-                }
-            } else {
-                (chunk_start..chunk_end).map(fetch).collect()
+        for (pi, page) in pages.into_iter().enumerate() {
+            let Some(ScanPage { body, band }) = page else {
+                continue;
             };
-            let this_chunk_start = chunk_start;
-            chunk_start = chunk_end;
-            for (off, item) in pre.into_iter().enumerate() {
-                let pi = this_chunk_start + off;
-                let Some((spans, page_width, page_height)) = item else {
-                    continue;
-                };
-                let vertical = Self::page_is_vertical(&spans);
-                // Require that the page has CONTENT outside the chrome band(s)
-                // before counting band spans as candidate artifacts. Otherwise, a
-                // page consisting only of a title near the top would have its own
-                // title classified as a "running header" across all pages. (For
-                // horizontal pages this is identical to the prior top/bottom test.)
-                let has_body_content = spans.iter().any(|s| {
-                    !s.text.trim().is_empty()
-                        && !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
-                });
-                if has_body_content {
-                    body_content_pages.insert(pi);
-                }
-                let mut seen_this_page: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for s in spans.iter() {
-                    let trimmed = s.text.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical) {
-                        continue;
-                    }
-                    let sig = Self::normalize_artifact_signature(trimmed);
-                    if sig.is_empty() || sig.chars().count() < 2 {
-                        continue;
-                    }
-                    signature_positions.entry(sig.clone()).or_default().push((
-                        pi,
-                        s.bbox,
-                        trimmed.to_string(),
-                    ));
-                    seen_this_page
-                        .entry(sig)
-                        .or_insert_with(|| trimmed.to_string());
-                }
-                for (sig, literal) in &seen_this_page {
-                    literal_variants
-                        .entry(sig.clone())
-                        .or_default()
-                        .insert(literal.clone());
-                }
-                if !has_body_content {
-                    continue;
-                }
-                for sig in seen_this_page.into_keys() {
-                    let entry = occurrences.entry(sig).or_insert((0, pi));
-                    entry.0 += 1;
-                    if pi < entry.1 {
-                        entry.1 = pi;
-                    }
+            // Require that the page has CONTENT outside the chrome band(s)
+            // before counting band spans as candidate artifacts (see
+            // `scan_page`).
+            if body {
+                body_content_pages.insert(pi);
+            }
+            let mut seen_this_page: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (sig, bbox, trimmed) in band {
+                seen_this_page
+                    .entry(sig.clone())
+                    .or_insert_with(|| trimmed.clone());
+                signature_positions
+                    .entry(sig)
+                    .or_default()
+                    .push((pi, bbox, trimmed));
+            }
+            for (sig, literal) in &seen_this_page {
+                literal_variants
+                    .entry(sig.clone())
+                    .or_default()
+                    .insert(literal.clone());
+            }
+            if !body {
+                continue;
+            }
+            for sig in seen_this_page.into_keys() {
+                let entry = occurrences.entry(sig).or_insert((0, pi));
+                entry.0 += 1;
+                if pi < entry.1 {
+                    entry.1 = pi;
                 }
             }
         }
@@ -17416,7 +17483,8 @@ impl PdfDocument {
     }
 
     /// Raw spans for the running header/footer scan. The scan walks pages in
-    /// its own order (in parallel when the caller is not a rayon worker), so it
+    /// its own order (in parallel when the caller is not a rayon worker or
+    /// asks for it, `scan_running_artifacts_on_current_pool`), so it
     /// keeps out of the Form XObject span cache, whose entries carry the page
     /// that filled them: the caller's own extraction order alone fills it.
     fn extract_spans_for_scan(&self, page_index: usize) -> Result<Vec<TextSpan>> {

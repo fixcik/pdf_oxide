@@ -136,3 +136,92 @@ fn object_body_read_is_positioned_under_concurrent_peeks() {
         assert_eq!(tags, want, "objects read from a moved reader");
     }
 }
+
+/// `pages` pages with a running header, a "Page N" footer (the number
+/// varies) and a body line.
+fn running_heads_pdf(pages: usize) -> Vec<u8> {
+    let first_page = 4;
+    let kids: Vec<String> = (0..pages)
+        .map(|i| format!("{} 0 R", first_page + 2 * i))
+        .collect();
+    let mut objs = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", kids.join(" ")),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+    ];
+    for i in 0..pages {
+        objs.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R \
+             /Resources << /Font << /F1 3 0 R >> >> >>",
+            first_page + 2 * i + 1
+        ));
+        objs.push(stream(
+            "",
+            &format!(
+                "BT /F1 9 Tf 72 760 Td (Annual report 2026) Tj ET \
+                 BT /F1 12 Tf 72 400 Td (Body text of page {i}, unique words {i}) Tj ET \
+                 BT /F1 9 Tf 290 30 Td (Page {}) Tj ET",
+                i + 1
+            ),
+        ));
+    }
+    build(&objs)
+}
+
+/// The signature map in a comparable form.
+fn signatures_of(doc: &PdfDocument) -> Vec<(String, usize, Vec<(usize, [u32; 4])>)> {
+    let map = doc.ensure_running_artifact_signatures().unwrap();
+    let mut out: Vec<_> = map
+        .iter()
+        .map(|(sig, s)| {
+            let occ = s
+                .occurrences
+                .iter()
+                .map(|(pi, r)| {
+                    let b = [r.x, r.y, r.width, r.height].map(f32::to_bits);
+                    (*pi, b)
+                })
+                .collect();
+            (sig.clone(), s.first_seen_page, occ)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn scan_on_current_pool_equals_the_sequential_scan() {
+    let bytes = running_heads_pdf(41);
+    let pool = |n| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .unwrap()
+    };
+    // Lazy scan on a worker: sequential.
+    let seq = PdfDocument::from_bytes(bytes.clone()).unwrap();
+    let want = pool(1).install(|| signatures_of(&seq));
+    assert!(
+        want.iter().any(|(sig, ..)| sig.contains('#')),
+        "the page-number footer is a signature: {want:?}"
+    );
+    for threads in [1, 2, 4, 64] {
+        let par = PdfDocument::from_bytes(bytes.clone()).unwrap();
+        pool(4).install(|| {
+            par.scan_running_artifacts_on_current_pool(threads).unwrap();
+            // Computed once: the lazy path now returns the stored map.
+            assert_eq!(signatures_of(&par), want, "threads {threads}");
+        });
+        let a: Vec<_> = seq.extract_spans(7).unwrap();
+        let b: Vec<_> = par.extract_spans(7).unwrap();
+        let marks = |v: &[TextSpan]| -> Vec<(String, bool)> {
+            v.iter()
+                .map(|s| (s.text.clone(), s.artifact_type.is_some()))
+                .collect()
+        };
+        assert_eq!(marks(&b), marks(&a));
+        assert!(marks(&a).iter().any(|(_, m)| *m), "{:?}", marks(&a));
+    }
+}
