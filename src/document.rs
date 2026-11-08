@@ -17050,7 +17050,7 @@ impl PdfDocument {
         // steal an outer task that re-enters here) fetch it in parallel in
         // bounded chunks; the aggregation below stays sequential.
         let fetch = |pi: usize| -> Option<(Vec<crate::layout::TextSpan>, f32, f32)> {
-            let spans = self.extract_spans_raw_uncached(pi).ok()?;
+            let spans = self.extract_spans_for_scan(pi).ok()?;
             match self.get_page_media_box(pi) {
                 Ok((_, _, w, h)) if h > 0.0 => Some((spans, w, h)),
                 _ => None,
@@ -17353,7 +17353,16 @@ impl PdfDocument {
         page_index: usize,
         config: crate::extractors::TextExtractionConfig,
     ) -> Result<Vec<crate::layout::TextSpan>> {
-        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new())
+        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new(), false)
+    }
+
+    /// Raw spans for the running header/footer scan. The scan walks pages in
+    /// its own order (in parallel when the caller is not a rayon worker), so it
+    /// keeps out of the Form XObject span cache, whose entries carry the page
+    /// that filled them: the caller's own extraction order alone fills it.
+    fn extract_spans_for_scan(&self, page_index: usize) -> Result<Vec<TextSpan>> {
+        let config = crate::extractors::TextExtractionConfig::default();
+        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new(), true)
     }
 
     fn extract_spans_raw_filtered(
@@ -17367,6 +17376,7 @@ impl PdfDocument {
             crate::extractors::TextExtractionConfig::default(),
             excluded_layers,
             excluded_inks,
+            false,
         )
     }
 
@@ -17376,6 +17386,7 @@ impl PdfDocument {
         config: crate::extractors::TextExtractionConfig,
         excluded_layers: HashSet<String>,
         excluded_inks: HashSet<String>,
+        bypass_form_span_cache: bool,
     ) -> Result<Vec<crate::layout::TextSpan>> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning no spans");
@@ -17414,6 +17425,9 @@ impl PdfDocument {
         // by default; Form XObject Do invocations push their own scope
         // on top of the stack inside the extractor.
         extractor.set_page_index(page_index as u32);
+        if bypass_form_span_cache {
+            extractor.bypass_form_span_cache();
+        }
         let visibility_facts = self.visibility_facts.load(Ordering::Relaxed);
         let filtered = !excluded_layers.is_empty() || !excluded_inks.is_empty();
         if visibility_facts {

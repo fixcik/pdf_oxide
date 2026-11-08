@@ -2408,8 +2408,11 @@ pub struct TextExtractor<'doc> {
     /// (`PdfDocument::set_visibility_facts`). `None` keeps every code path
     /// and output identical to an extractor without the feature.
     vis: Option<Box<crate::extractors::visibility::VisibilityTracker>>,
+    /// Skip the document's Form XObject span cache (see `form_span_cache`).
+    form_span_cache_off: bool,
 }
 
+mod form_span_cache;
 mod glyph_facts;
 
 impl<'doc> TextExtractor<'doc> {
@@ -2501,6 +2504,7 @@ impl<'doc> TextExtractor<'doc> {
             // own scope on top.
             mcid_scope_stack: vec![crate::structure::McidScope::Page(0)],
             vis: None,
+            form_span_cache_off: false,
         }
     }
 
@@ -7334,26 +7338,9 @@ impl<'doc> TextExtractor<'doc> {
         //
         // `ctm_key` was already computed above for the `processed_xobjects` guard.
         let spans_cache_key = (xobject_ref, ctm_key);
-        // Cached spans carry the facts of the invocation that filled the
-        // cache (alpha, clip, OC are inherited from the caller at `Do`), so
-        // visibility facts bypass the cache like the emission filters do.
-        let has_filters = !self.excluded_layers.is_empty()
-            || !self.excluded_inks.is_empty()
-            || self.vis.is_some();
-        if self.extract_spans && !has_filters {
-            let cached_spans = {
-                doc.xobject_spans_cache
-                    .lock()
-                    .unwrap()
-                    .get(&spans_cache_key)
-                    .cloned()
-            };
-            if let Some(cached_spans) = cached_spans {
-                if let Some(spans) = cached_spans {
-                    self.spans.extend(spans.iter().cloned());
-                }
-                return Ok(());
-            }
+        let span_cache_on = self.form_span_cache_on();
+        if span_cache_on && self.replay_cached_form_spans(&spans_cache_key) {
+            return Ok(());
         }
 
         // Load the XObject (now known to be Form or unknown — worth the full load)
@@ -7747,16 +7734,8 @@ impl<'doc> TextExtractor<'doc> {
                 // We still require `has_own_resources` so that font lookups are
                 // self-contained; XObjects that inherit page-level fonts would
                 // produce spans whose glyph mappings depend on caller context.
-                if has_own_resources && self.extract_spans && !has_filters {
-                    let new_spans = if self.spans.len() > spans_before {
-                        Some(self.spans[spans_before..].to_vec())
-                    } else {
-                        None
-                    };
-                    doc.xobject_spans_cache
-                        .lock()
-                        .unwrap()
-                        .insert(spans_cache_key, new_spans);
+                if has_own_resources && span_cache_on {
+                    self.store_form_spans(spans_cache_key, spans_before);
                 }
 
                 // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)

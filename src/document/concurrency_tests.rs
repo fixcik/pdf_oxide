@@ -1,4 +1,5 @@
-//! Shared document state touched by several threads at once.
+//! Shared document state touched by several threads at once: the byte
+//! reader and the Form XObject span cache.
 
 use super::*;
 
@@ -28,6 +29,71 @@ fn build(objs: &[String]) -> Vec<u8> {
 
 fn stream(dict: &str, data: &str) -> String {
     format!("<< {dict} /Length {} >>\nstream\n{data}\nendstream", data.len())
+}
+
+/// `pages` pages, each painting the shared header form (object 4, own
+/// /Resources) and a body line.
+fn header_form_pdf(pages: usize) -> Vec<u8> {
+    let first_page = 5;
+    let kids: Vec<String> = (0..pages)
+        .map(|i| format!("{} 0 R", first_page + 2 * i))
+        .collect();
+    let mut objs = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", kids.join(" ")),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >>",
+            "BT /F1 9 Tf 72 760 Td (Journal of Things) Tj ET",
+        ),
+    ];
+    for i in 0..pages {
+        objs.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R \
+             /Resources << /Font << /F1 3 0 R >> /XObject << /Hd 4 0 R >> >> >>",
+            first_page + 2 * i + 1
+        ));
+        objs.push(stream(
+            "",
+            &format!("q /Hd Do Q BT /F1 12 Tf 72 400 Td (Body text of page {i}) Tj ET"),
+        ));
+    }
+    build(&objs)
+}
+
+#[test]
+fn header_footer_scan_stays_out_of_the_form_span_cache() {
+    let doc = PdfDocument::from_bytes(header_form_pdf(4)).unwrap();
+    doc.ensure_running_artifact_signatures().unwrap();
+    assert_eq!(
+        doc.xobject_spans_cache.lock_or_recover().len(),
+        0,
+        "the scan filled the form span cache: its page order would decide what callers replay"
+    );
+    // Control: the caller's own extraction does fill it.
+    doc.extract_spans_raw_uncached(2).unwrap();
+    assert_eq!(doc.xobject_spans_cache.lock_or_recover().len(), 1);
+}
+
+#[test]
+fn scan_does_not_change_the_spans_a_caller_gets() {
+    let fresh = PdfDocument::from_bytes(header_form_pdf(4)).unwrap();
+    let want: Vec<(String, usize)> = fresh
+        .extract_spans_raw_uncached(3)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.text, s.sequence))
+        .collect();
+    let scanned = PdfDocument::from_bytes(header_form_pdf(4)).unwrap();
+    scanned.ensure_running_artifact_signatures().unwrap();
+    let got: Vec<(String, usize)> = scanned
+        .extract_spans_raw_uncached(3)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.text, s.sequence))
+        .collect();
+    assert_eq!(got, want);
 }
 
 /// Probabilistic (thread timing): `is_form_xobject` peeks the shared reader
