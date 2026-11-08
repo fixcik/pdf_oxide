@@ -3491,6 +3491,7 @@ impl PdfDocument {
             let mut full_header = line.to_string();
             let max_header_lines = 5;
             let mut lines_read = 1;
+            let mut header_len = bytes_read;
 
             while !has_standalone_obj_keyword(&full_header) && lines_read < max_header_lines {
                 let mut next_bytes = Vec::new();
@@ -3498,13 +3499,14 @@ impl PdfDocument {
                 if next_read == 0 {
                     break;
                 }
+                header_len += next_read;
                 let next_line = String::from_utf8_lossy(&next_bytes);
                 full_header.push(' ');
                 full_header.push_str(&next_line);
                 lines_read += 1;
             }
             // Reader guard drops here — before any recursive fallback calls.
-            (header_bytes, full_header, reader.stream_position()?)
+            (header_bytes, full_header, offset + header_len as u64)
         };
 
         // Verify object header format
