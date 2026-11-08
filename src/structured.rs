@@ -27,6 +27,7 @@
 use crate::extractors::text::{ArtifactType, PaginationSubtype};
 use crate::geometry::Rect;
 use crate::layout::TextSpan;
+mod region_join;
 
 /// A single page decomposed into typed regions in reading order.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -466,16 +467,11 @@ pub(crate) fn build_structured_page_full(
         // Nearest Sect/Art/Part section (§14.8.4.2 — #734 §5/§6).
         let section = mcid.and_then(|m| struct_info.section.get(&m).copied());
 
-        // Region grouping:
-        //  * A column-tagged body span (`col` is `Some`) merges into the FIRST
-        //    region of the same role + column (+ section) so a two-column page
-        //    yields one region per column — left column whole, then right —
-        //    instead of interleaved per-line regions (#734 Fix 1). The per-column
-        //    spans arrive in reading (y) order, so each region's text is the
-        //    column read top-to-bottom. A section change forces a new region so
-        //    chapters stay separate.
-        //  * Full-width / untagged content keeps adjacent-only coalescing, so
-        //    distinct blocks (separate headings, paragraphs) stay separate.
+        // Region grouping: a column-tagged body span (`col` is `Some`) joins the
+        // FIRST region of its role + column (+ section), so a two-column page reads
+        // left column whole, then right (#734 Fix 1; spans arrive in y order, a
+        // section change starts a new region). Full-width / untagged content only
+        // coalesces with the adjacent region, so distinct blocks stay separate.
         let merge_idx = if col.is_some() {
             regions
                 .iter()
@@ -490,7 +486,9 @@ pub(crate) fn build_structured_page_full(
         };
         if let Some(i) = merge_idx {
             let r = &mut regions[i];
-            r.text.push(' ');
+            if !region_join::kerned(r.spans.last(), &span) {
+                r.text.push(' '); // a kerned letter pair split in two spans is one word
+            }
             r.text.push_str(span.text.trim());
             r.bbox = rect_union(&r.bbox, &span.bbox);
             r.spans.push(span);
