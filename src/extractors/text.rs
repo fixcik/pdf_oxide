@@ -2308,11 +2308,11 @@ pub struct TextExtractor<'doc> {
     /// Per PDF Spec Section 14.6, artifact content should be excluded from text extraction.
     /// This flag is true when any ancestor in the marked_content_stack has is_artifact=true.
     inside_artifact: bool,
-    /// Layer names (Optional Content Groups) to exclude from extraction.
-    ///
-    /// When a BDC operator with tag "OC" references an OCG whose /Name matches
-    /// one of these entries, all content within that marked content scope is suppressed.
-    excluded_layers: HashSet<String>,
+    /// Optional content groups to exclude: content within a BDC/EMC scope
+    /// tagged "OC" whose group (or OCMD) the filter turns off is suppressed.
+    excluded_layers: crate::optional_content::LayerFilter,
+    /// Cached: the document's default configuration hides layers.
+    doc_hides_layers: Option<bool>,
     /// Whether we're currently inside an excluded OCG layer.
     ///
     /// True when any ancestor in the marked_content_stack has is_excluded_layer=true.
@@ -2414,6 +2414,7 @@ pub struct TextExtractor<'doc> {
 
 mod form_span_cache;
 mod glyph_facts;
+mod oc_filter;
 
 impl<'doc> TextExtractor<'doc> {
     /// Fraction of a glyph's advance width considered "overlap" for
@@ -2485,7 +2486,8 @@ impl<'doc> TextExtractor<'doc> {
             marked_content_stack: Vec::new(), // Track marked content contexts
             saw_reversed_chars: false,
             inside_artifact: false, // Track artifact state
-            excluded_layers: HashSet::new(),
+            excluded_layers: Default::default(),
+            doc_hides_layers: None,
             inside_excluded_layer: false,
             inside_placed_pdf: false,
             placed_pdf_keep: false,
@@ -2596,14 +2598,6 @@ impl<'doc> TextExtractor<'doc> {
     /// channel for the struct-tree-scope ActualText applier.
     pub fn take_mc_actualtext_mcids(&mut self) -> HashSet<u32> {
         std::mem::take(&mut self.mc_actualtext_mcids)
-    }
-
-    /// Set layer names (Optional Content Groups) to exclude from extraction.
-    ///
-    /// Content within BDC/EMC scopes tagged "OC" whose OCG /Name matches one of
-    /// the provided names will be suppressed during text extraction.
-    pub fn set_excluded_layers(&mut self, layers: HashSet<String>) {
-        self.excluded_layers = layers;
     }
 
     /// Set ink / separation names to exclude from extraction.
@@ -3088,23 +3082,6 @@ impl<'doc> TextExtractor<'doc> {
         crate::optional_content::decode_pdf_text_string(bytes)
     }
 
-    /// Resolve BDC properties: can be an inline dictionary or a name referencing /Properties resource.
-    ///
-    /// Thin delegate to [`crate::optional_content::resolve_bdc_properties`].
-    /// Passing `self.document` as `Option` lets the inline-dict fast path work
-    /// even on a freshly-constructed extractor with no document attached (used
-    /// by unit tests).
-    fn resolve_bdc_properties(
-        &self,
-        properties: &Object,
-    ) -> Option<std::collections::HashMap<String, Object>> {
-        crate::optional_content::resolve_bdc_properties(
-            properties,
-            self.resources.as_ref(),
-            self.document,
-        )
-    }
-
     /// Resolve a named color space from the /Resources /ColorSpace dictionary.
     ///
     /// PDF content streams reference color spaces by name (e.g. `cs /CS1`).
@@ -3195,19 +3172,6 @@ impl<'doc> TextExtractor<'doc> {
             }
         }
         false
-    }
-
-    /// Check whether a BDC properties dict represents an excluded OCG or OCMD.
-    ///
-    /// Thin delegate to [`crate::optional_content::check_ocg_excluded`] — that
-    /// module is the single source of truth for OCG/OCMD evaluation, including
-    /// OCMD `/P` visibility-policy handling.
-    fn check_ocg_excluded(&self, props_dict: &std::collections::HashMap<String, Object>) -> bool {
-        let doc = match self.document {
-            Some(d) => d,
-            None => return false,
-        };
-        crate::optional_content::check_ocg_excluded(props_dict, doc, &self.excluded_layers)
     }
 
     /// Get current ActualText from marked content stack (PDF Spec Section 14.9.4).
@@ -3612,7 +3576,7 @@ impl<'doc> TextExtractor<'doc> {
     }
 
     fn run_content_stream(&mut self, content_stream: &[u8]) -> Result<()> {
-        if self.has_emission_filter() {
+        if self.has_emission_filter() || self.full_parse_for_layers(content_stream) {
             let operators = crate::content::parser::parse_content_stream_for_text(content_stream)?;
             for op in operators {
                 self.execute_operator(op)?;
@@ -5747,29 +5711,6 @@ impl<'doc> TextExtractor<'doc> {
         }
     }
 
-    /// The XObject dict carries `/OC` naming an excluded layer (§8.11.3.3:
-    /// such an XObject is not drawn).
-    fn xobject_oc_hidden(&self, dict: &HashMap<String, Object>) -> bool {
-        self.oc_entry_hidden(dict.get("OC"))
-    }
-
-    fn oc_entry_hidden(&self, oc: Option<&Object>) -> bool {
-        if self.excluded_layers.is_empty() {
-            return false;
-        }
-        let (Some(oc), Some(doc)) = (oc, self.document) else {
-            return false;
-        };
-        let resolved = match oc.as_reference() {
-            Some(r) => doc.load_object(r).ok(),
-            None => Some(oc.clone()),
-        };
-        resolved
-            .as_ref()
-            .and_then(|o| o.as_dict())
-            .is_some_and(|d| self.check_ocg_excluded(d))
-    }
-
     /// Record an image or text-free form XObject as a paint event.
     fn record_xobject_paint(&mut self, xobject_ref: ObjectRef) {
         use crate::cache::MutexExt as _;
@@ -7055,7 +6996,7 @@ impl<'doc> TextExtractor<'doc> {
 
                 let mut is_excluded_layer = false;
 
-                if let Some(props_dict) = self.resolve_bdc_properties(&properties) {
+                if let Some((oc_ref, props_dict)) = self.resolve_bdc_properties(&properties) {
                     if let Some(mcid_obj) = props_dict.get("MCID") {
                         if let Some(mcid) = mcid_obj.as_integer() {
                             own_mcid = Some(mcid as u32);
@@ -7095,7 +7036,7 @@ impl<'doc> TextExtractor<'doc> {
                     //  - Direct OCG: << /Type /OCG /Name /LayerName >>
                     //  - OCMD:       << /Type /OCMD /OCGs [refs...] /P /policy >>
                     if tag == "OC" && !self.excluded_layers.is_empty() {
-                        is_excluded_layer = self.check_ocg_excluded(&props_dict);
+                        is_excluded_layer = self.check_ocg_excluded(oc_ref, &props_dict);
                     }
                 }
 
@@ -7297,7 +7238,7 @@ impl<'doc> TextExtractor<'doc> {
 
         // Skip already-processed (XObject, CTM) pairs — each unique combination
         // is processed at most once per page for text extraction.
-        if self.processed_xobjects.contains(&xobj_key) {
+        if self.do_is_in_excluded_layer() || self.processed_xobjects.contains(&xobj_key) {
             return Ok(());
         }
 

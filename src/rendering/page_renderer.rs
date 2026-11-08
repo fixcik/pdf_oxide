@@ -252,7 +252,7 @@ pub struct PageRenderer {
     /// deep-cloning the set per nested Form XObject. Recomputed on the first
     /// access per `render_page` invocation. Stays `None` (no allocation) when
     /// the set is empty — the common case.
-    excluded_layers_snapshot: Option<Arc<HashSet<String>>>,
+    excluded_layers_snapshot: Option<Arc<crate::optional_content::LayerFilter>>,
     /// Per-page compiled qcms transform cache. The resolution
     /// pipeline borrows this through `ResolutionContext` so every
     /// CMYK paint operator within a page reuses the same compiled
@@ -502,13 +502,10 @@ impl PageRenderer {
         // Refresh the excluded-layers snapshot once per page. The effective
         // set combines (a) the PDF's default-off OCGs per /OCProperties/D
         // (BaseState, /ON, /OFF) — ISO 32000-1 §8.11.4 — with (b) the caller's
-        // explicit excluded_layers. This makes the renderer respect the PDF's
-        // default visibility configuration, matching a viewer's initial state.
-        let default_off = crate::optional_content::compute_default_off_ocgs(doc);
-        let effective: HashSet<String> = default_off
-            .into_iter()
-            .chain(self.options.excluded_layers.iter().cloned())
-            .collect();
+        // explicit excluded_layers (by /Name). Default-off groups are matched
+        // by reference: names are neither unique nor required.
+        let effective = crate::optional_content::LayerFilter::document_default(doc)
+            .with_names(self.options.excluded_layers.iter().cloned());
         self.excluded_layers_snapshot = if effective.is_empty() {
             None
         } else {
@@ -816,12 +813,13 @@ impl PageRenderer {
         // by `render_page_with_options`). Recursive calls into this function
         // reuse the same `Arc` without any allocation. We snapshot it as a
         // local `Arc::clone` (cheap pointer copy) so the operator loop below
-        // can hold a `&HashSet` reference while still calling `&mut self`
+        // can hold a `&LayerFilter` reference while still calling `&mut self`
         // methods through the inner match arms.
-        let snapshot: Option<Arc<HashSet<String>>> = self.excluded_layers_snapshot.clone();
-        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
-        let empty_ref: &HashSet<String> = EMPTY.get_or_init(HashSet::new);
-        let excluded_layers: &HashSet<String> = snapshot.as_deref().unwrap_or(empty_ref);
+        use crate::optional_content::LayerFilter;
+        let snapshot: Option<Arc<LayerFilter>> = self.excluded_layers_snapshot.clone();
+        static EMPTY: std::sync::OnceLock<LayerFilter> = std::sync::OnceLock::new();
+        let empty_ref: &LayerFilter = EMPTY.get_or_init(LayerFilter::default);
+        let excluded_layers: &LayerFilter = snapshot.as_deref().unwrap_or(empty_ref);
         let mut gs_stack = GraphicsStateStack::new();
 
         // §8.10.1 (`docs/spec/pdf.md`:15226): "Except as described above, the
@@ -8956,15 +8954,14 @@ impl PageRenderer {
     ) -> Result<()> {
         let annotations = doc.get_annotations(page_num)?;
         // Reuse the per-render snapshot so we don't deep-clone the HashSet here.
-        let excluded_snapshot: Option<Arc<HashSet<String>>> = self.excluded_layers_snapshot.clone();
+        let excluded_snapshot = self.excluded_layers_snapshot.clone();
         for annot in annotations {
             // Per ISO 32000-1 §12.5.2, an annotation dict may carry an /OC
             // entry referencing the OCG/OCMD the annotation belongs to. Skip
             // the annotation entirely if its layer is excluded.
-            if let Some(ref excluded_layers) = excluded_snapshot {
+            if let Some(excluded) = excluded_snapshot.as_deref() {
                 if let Some(oc_obj) = annot.raw_dict.as_ref().and_then(|d| d.get("OC")) {
-                    if crate::optional_content::annotation_is_excluded(oc_obj, doc, excluded_layers)
-                    {
+                    if crate::optional_content::annotation_is_excluded(oc_obj, doc, excluded) {
                         continue;
                     }
                 }

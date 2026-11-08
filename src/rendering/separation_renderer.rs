@@ -128,7 +128,7 @@
     clippy::only_used_in_recursion
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tiny_skia::{FillRule, Mask, PathBuilder, Pixmap, Transform};
@@ -309,7 +309,7 @@ fn render_plates_for_inks(
         // rather than passed in, because the separation entry points take no
         // render options — and the defect this closes is a layer the *document*
         // hides being counted as ink.
-        let excluded_layers = crate::optional_content::compute_default_off_ocgs(doc);
+        let excluded_layers = crate::optional_content::LayerFilter::document_default(doc);
 
         let mut ctx = SeparationContext {
             doc,
@@ -1265,7 +1265,7 @@ struct SeparationContext<'a> {
     /// (ISO 32000-1:2008 §8.11.4), computed exactly as the composite renderer
     /// computes its baseline. Without this the plates counted ink for layers
     /// the page render omits, so the two disagreed about the same page.
-    excluded_layers: &'a HashSet<String>,
+    excluded_layers: &'a crate::optional_content::LayerFilter,
 }
 
 /// Color state tracked alongside the graphics state for separation rendering.
@@ -1431,7 +1431,7 @@ fn execute_separation_operators(
     // entries that incremented.
     let mut excluded_layer_depth: u32 = 0;
     let mut marked_content_is_excluded: Vec<bool> = Vec::new();
-    let excluded_layers: &HashSet<String> = ctx.excluded_layers;
+    let excluded_layers = ctx.excluded_layers;
 
     for op in operators {
         // ISO 32000-1:2008 §8.11.3: when optional content is hidden "the

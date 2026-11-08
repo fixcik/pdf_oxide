@@ -63,6 +63,7 @@ pub enum ReadingOrder {
 #[cfg(test)]
 mod concurrency_tests;
 mod font_sets;
+mod layers;
 mod pdf_reader;
 use pdf_reader::PdfReader;
 
@@ -12821,7 +12822,8 @@ impl PdfDocument {
         excluded_layers: HashSet<String>,
         excluded_inks: HashSet<String>,
     ) -> Result<Vec<crate::layout::TextSpan>> {
-        let spans = self.extract_spans_raw_filtered(page_index, excluded_layers, excluded_inks)?;
+        let layers = crate::optional_content::LayerFilter::from_names(excluded_layers);
+        let spans = self.extract_spans_raw_filtered(page_index, layers, excluded_inks)?;
         self.postprocess_spans(page_index, spans)
     }
 
@@ -17356,7 +17358,7 @@ impl PdfDocument {
         page_index: usize,
         config: crate::extractors::TextExtractionConfig,
     ) -> Result<Vec<crate::layout::TextSpan>> {
-        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new(), false)
+        self.extract_spans_impl(page_index, config, Default::default(), HashSet::new(), false)
     }
 
     /// Raw spans for the running header/footer scan. The scan walks pages in
@@ -17365,13 +17367,13 @@ impl PdfDocument {
     /// that filled them: the caller's own extraction order alone fills it.
     fn extract_spans_for_scan(&self, page_index: usize) -> Result<Vec<TextSpan>> {
         let config = crate::extractors::TextExtractionConfig::default();
-        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new(), true)
+        self.extract_spans_impl(page_index, config, Default::default(), HashSet::new(), true)
     }
 
     fn extract_spans_raw_filtered(
         &self,
         page_index: usize,
-        excluded_layers: HashSet<String>,
+        excluded_layers: crate::optional_content::LayerFilter,
         excluded_inks: HashSet<String>,
     ) -> Result<Vec<crate::layout::TextSpan>> {
         self.extract_spans_impl(
@@ -17387,7 +17389,7 @@ impl PdfDocument {
         &self,
         page_index: usize,
         config: crate::extractors::TextExtractionConfig,
-        excluded_layers: HashSet<String>,
+        excluded_layers: crate::optional_content::LayerFilter,
         excluded_inks: HashSet<String>,
         bypass_form_span_cache: bool,
     ) -> Result<Vec<crate::layout::TextSpan>> {
@@ -17437,7 +17439,7 @@ impl PdfDocument {
             extractor.enable_visibility_facts();
         }
         if !excluded_layers.is_empty() {
-            extractor.set_excluded_layers(excluded_layers);
+            extractor.set_layer_filter(excluded_layers);
         }
         if !excluded_inks.is_empty() {
             extractor.set_excluded_inks(excluded_inks);
@@ -17590,69 +17592,17 @@ impl PdfDocument {
         page_index: usize,
         reading_order: ReadingOrder,
     ) -> Result<Vec<crate::layout::TextSpan>> {
-        self.extract_spans_filtered_with_reading_order(
-            page_index,
-            reading_order,
-            HashSet::new(),
-            HashSet::new(),
-        )
+        self.spans_in_reading_order(page_index, reading_order, Default::default(), HashSet::new())
     }
 
-    /// Extract positioned spans in a reading order, excluding optional-content
-    /// layers and/or Separation/DeviceN inks.
+    /// [`Self::extract_spans_filtered_with_reading_order`], by [`LayerFilter`].
     ///
-    /// This is [`extract_spans_with_reading_order`](Self::extract_spans_with_reading_order)
-    /// and [`extract_text_filtered`](Self::extract_text_filtered) combined: the
-    /// former cannot filter, and the latter returns assembled text rather than
-    /// positioned spans. A consumer that lays spans out itself - an HTML/XML
-    /// emitter placing each span at its own rectangle - needs both at once.
-    ///
-    /// The motivating case is render/extract parity. `render_page` honours the
-    /// document's default configuration `/OCProperties/D`, but span extraction
-    /// treats everything as visible unless the caller names layers (see the
-    /// `optional_content` module note). Passing
-    /// `optional_content::compute_default_off_ocgs(&doc)` as `excluded_layers`
-    /// makes extraction agree with what the page actually displays - without it,
-    /// a default-OFF layer holding a copy of the page contributes a SECOND copy
-    /// of every word.
-    ///
-    /// Empty sets are exactly equivalent to the unfiltered call, so this is a
-    /// superset of the existing API and costs nothing when no filtering is asked
-    /// for.
-    ///
-    /// # Arguments
-    ///
-    /// * `page_index` - Zero-based page index
-    /// * `reading_order` - The reading order strategy to apply
-    /// * `excluded_layers` - OCG layer names to suppress (empty = no filtering)
-    /// * `excluded_inks` - Separation/DeviceN ink names to suppress (empty = none)
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use pdf_oxide::document::{PdfDocument, ReadingOrder};
-    /// # use pdf_oxide::optional_content;
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let doc = PdfDocument::open("layered.pdf")?;
-    /// // Agree with what the page displays: drop the default-off layers.
-    /// let hidden = optional_content::compute_default_off_ocgs(&doc);
-    /// let spans = doc.extract_spans_filtered_with_reading_order(
-    ///     0,
-    ///     ReadingOrder::ColumnAware,
-    ///     hidden,
-    ///     Default::default(),
-    /// )?;
-    /// for span in spans {
-    ///     println!("{}", span.text);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn extract_spans_filtered_with_reading_order(
+    /// [`LayerFilter`]: crate::optional_content::LayerFilter
+    fn spans_in_reading_order(
         &self,
         page_index: usize,
         reading_order: ReadingOrder,
-        excluded_layers: HashSet<String>,
+        excluded_layers: crate::optional_content::LayerFilter,
         excluded_inks: HashSet<String>,
     ) -> Result<Vec<crate::layout::TextSpan>> {
         // Extract raw spans using the common extraction logic. The unfiltered
@@ -17883,48 +17833,7 @@ impl PdfDocument {
         // Same spans/dimensions `extract_page_text` would produce, minus the
         // per-character `TextChar` expansion it builds and this path never reads.
         let spans = self.extract_spans_with_reading_order(page_index, ReadingOrder::default())?;
-        let media_box = self.get_page_media_box(page_index)?;
-        let struct_info = self.structured_mcid_info(page_index);
-        Ok(crate::structured::build_structured_page_full(
-            page_index,
-            media_box.2,
-            media_box.3,
-            spans,
-            column_mode,
-            &struct_info,
-        ))
-    }
-
-    /// [`extract_structured`](Self::extract_structured) with optional-content
-    /// layers and/or Separation/DeviceN inks excluded — the structured
-    /// counterpart of
-    /// [`extract_spans_filtered_with_reading_order`](Self::extract_spans_filtered_with_reading_order).
-    /// Pass `optional_content::compute_default_off_ocgs(&doc)` as
-    /// `excluded_layers` to drop what the page does not display by default
-    /// (`BDC /OC` sequences and XObjects whose `/OC` is hidden). Empty sets
-    /// are exactly [`extract_structured`](Self::extract_structured).
-    pub fn extract_structured_filtered(
-        &self,
-        page_index: usize,
-        excluded_layers: HashSet<String>,
-        excluded_inks: HashSet<String>,
-    ) -> Result<crate::structured::StructuredPage> {
-        let spans = self.extract_spans_filtered_with_reading_order(
-            page_index,
-            ReadingOrder::default(),
-            excluded_layers,
-            excluded_inks,
-        )?;
-        let media_box = self.get_page_media_box(page_index)?;
-        let struct_info = self.structured_mcid_info(page_index);
-        Ok(crate::structured::build_structured_page_full(
-            page_index,
-            media_box.2,
-            media_box.3,
-            spans,
-            crate::structured::ColumnMode::Auto,
-            &struct_info,
-        ))
+        self.structured_from_spans(page_index, spans, column_mode)
     }
 
     /// Per-MCID structure facts for `extract_structured` (ISO 32000-1:2008
