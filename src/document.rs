@@ -60,43 +60,10 @@ pub enum ReadingOrder {
     Structure,
 }
 
-/// In-memory reader used by `open()` and `from_bytes()`. Wrapping in an enum
-/// is kept (rather than using `BufReader<Cursor<Vec<u8>>>` directly) so a
-/// future file-backed variant can be re-introduced without touching call
-/// sites.
-enum PdfReader {
-    Memory(BufReader<Cursor<Vec<u8>>>),
-}
-
-impl Read for PdfReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            PdfReader::Memory(r) => r.read(buf),
-        }
-    }
-}
-
-impl Seek for PdfReader {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match self {
-            PdfReader::Memory(r) => r.seek(pos),
-        }
-    }
-}
-
-impl BufRead for PdfReader {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        match self {
-            PdfReader::Memory(r) => r.fill_buf(),
-        }
-    }
-
-    fn consume(&mut self, amt: usize) {
-        match self {
-            PdfReader::Memory(r) => r.consume(amt),
-        }
-    }
-}
+#[cfg(test)]
+mod concurrency_tests;
+mod pdf_reader;
+use pdf_reader::PdfReader;
 
 /// Maximum recursion depth for object resolution
 const MAX_RECURSION_DEPTH: u32 = 100;
@@ -3495,7 +3462,7 @@ impl PdfDocument {
         // Holding one guard for seek+read prevents the split-lock race (#398 Race A)
         // where a concurrent thread can re-seek the shared BufReader between our
         // seek() and read_until() calls.
-        let (header_bytes, full_header) = {
+        let (header_bytes, full_header, body_start) = {
             let mut reader = self.reader.lock_or_recover();
             reader.seek(SeekFrom::Start(offset))?;
 
@@ -3536,7 +3503,7 @@ impl PdfDocument {
                 lines_read += 1;
             }
             // Reader guard drops here — before any recursive fallback calls.
-            (header_bytes, full_header)
+            (header_bytes, full_header, reader.stream_position()?)
         };
 
         // Verify object header format
@@ -3666,7 +3633,10 @@ impl PdfDocument {
         const MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB safety limit
 
         {
+            // Readers outside `load_lock` (`is_form_xobject`) move the shared
+            // reader between the two guards: resume at the body explicitly.
             let mut reader = self.reader.lock_or_recover();
+            pdf_reader::seek_to(&mut reader, body_start)?;
             loop {
                 let mut chunk = Vec::new();
                 let bytes_read = reader.read_until(b'\n', &mut chunk)?;
