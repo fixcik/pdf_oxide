@@ -571,7 +571,10 @@ fn soft_mask_decodes_the_smask_stream() {
     let doc = PdfDocument::from_bytes(build_pdf_with_smask(true)).expect("open PDF");
     let handles = doc.page_image_handles(0).expect("page_image_handles");
     assert_eq!(handles.len(), 1);
-    let mask = handles[0].soft_mask().expect("soft_mask").expect("has a mask");
+    let mask = handles[0]
+        .soft_mask()
+        .expect("soft_mask")
+        .expect("has a mask");
     assert_eq!((mask.width(), mask.height()), (2, 1));
     let gray = mask.to_dynamic_image().expect("mask pixels").to_luma8();
     assert_eq!(gray.as_raw().as_slice(), &[0, 255]);
