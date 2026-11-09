@@ -3492,6 +3492,30 @@ impl<'doc> PdfImageHandle<'doc> {
         }
     }
 
+    /// Decode the image's soft mask (`/SMask` of an Image XObject, ISO 32000-1
+    /// §11.6.5.3) into a [`PdfImage`] of the mask's own size and samples
+    /// (normally `DeviceGray`), or `None` when the image has no soft mask.
+    ///
+    /// Inline images cannot carry an `/SMask` and always give `None`; so does
+    /// an `/SMask` that is not a stream (e.g. the name `/None`). The mask may
+    /// differ in size from the image: callers that combine the two resample it.
+    pub fn soft_mask(&self) -> Result<Option<PdfImage>> {
+        use crate::extractors::extract_image_from_xobject;
+
+        let PdfImageSource::XObject(obj_ref) = &self.source else {
+            return Ok(None);
+        };
+        let obj = self.doc.load_object(*obj_ref)?;
+        let Some(entry) = obj.as_dict().and_then(|d| d.get("SMask")) else {
+            return Ok(None);
+        };
+        let mask = self.doc.resolve_object(entry)?;
+        if !matches!(mask, crate::object::Object::Stream { .. }) {
+            return Ok(None);
+        }
+        extract_image_from_xobject(Some(self.doc), &mask, entry.as_reference(), None).map(Some)
+    }
+
     /// For an Indexed image, the de-indexed *base* colour space.
     ///
     /// When [`color_space`](Self::color_space) is [`ColorSpace::Indexed`] the

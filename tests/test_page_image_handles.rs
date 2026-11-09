@@ -509,3 +509,78 @@ fn handle_methods_take_ref_and_clone() {
     assert_eq!(h2.width, h.width);
     assert!(h.raw_compressed_bytes().is_ok(), "original handle still usable");
 }
+
+/// One page painting a 2×1 RGB image XObject; with `smask` the image carries a 2×1 DeviceGray
+/// `/SMask` with samples 0x00 and 0xFF. Streams are uncompressed.
+fn build_pdf_with_smask(smask: bool) -> Vec<u8> {
+    let content = "q 100 0 0 50 10 10 cm /Im0 Do Q";
+    let rgb = [255u8, 0, 0, 0, 0, 255];
+    let alpha = [0u8, 255];
+    let sm = if smask { " /SMask 6 0 R" } else { "" };
+    let mut objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+          /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()).into_bytes(),
+    ];
+    let mut im = format!(
+        "<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB \
+         /BitsPerComponent 8{sm} /Length {} >>\nstream\n",
+        rgb.len()
+    )
+    .into_bytes();
+    im.extend_from_slice(&rgb);
+    im.extend_from_slice(b"\nendstream");
+    objs.push(im);
+    let mut m = format!(
+        "<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray \
+         /BitsPerComponent 8 /Length {} >>\nstream\n",
+        alpha.len()
+    )
+    .into_bytes();
+    m.extend_from_slice(&alpha);
+    m.extend_from_slice(b"\nendstream");
+    objs.push(m);
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offs = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offs.push(out.len());
+        out.extend(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend(o);
+        out.extend(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offs {
+        out.extend(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objs.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn soft_mask_decodes_the_smask_stream() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_smask(true)).expect("open PDF");
+    let handles = doc.page_image_handles(0).expect("page_image_handles");
+    assert_eq!(handles.len(), 1);
+    let mask = handles[0].soft_mask().expect("soft_mask").expect("has a mask");
+    assert_eq!((mask.width(), mask.height()), (2, 1));
+    let gray = mask.to_dynamic_image().expect("mask pixels").to_luma8();
+    assert_eq!(gray.as_raw().as_slice(), &[0, 255]);
+}
+
+#[test]
+fn soft_mask_is_none_without_smask() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_smask(false)).expect("open PDF");
+    let handles = doc.page_image_handles(0).expect("page_image_handles");
+    assert_eq!(handles.len(), 1);
+    assert!(handles[0].soft_mask().expect("soft_mask").is_none());
+}
