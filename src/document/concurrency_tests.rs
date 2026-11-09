@@ -160,7 +160,8 @@ fn running_heads_pdf(pages: usize) -> Vec<u8> {
             "",
             &format!(
                 "BT /F1 9 Tf 72 760 Td (Annual report 2026) Tj ET \
-                 BT /F1 12 Tf 72 400 Td (Body text of page {i}, unique words {i}) Tj ET \
+                 /Span << /MCID 0 /ActualText (Body {i}) >> BDC \
+                 BT /F1 12 Tf 72 400 Td (Body text of page {i}, unique words {i}) Tj ET EMC \
                  BT /F1 9 Tf 290 30 Td (Page {}) Tj ET",
                 i + 1
             ),
@@ -224,4 +225,77 @@ fn scan_on_current_pool_equals_the_sequential_scan() {
         assert_eq!(marks(&b), marks(&a));
         assert!(marks(&a).iter().any(|(_, m)| *m), "{:?}", marks(&a));
     }
+}
+
+/// Everything an `extract_spans_raw` call left behind for `page`: its spans
+/// (all fields), the page's ActualText MCIDs and unfiltered paints.
+fn raw_extraction_of(doc: &PdfDocument, page: usize) -> (String, String, String) {
+    let spans = format!("{:?}", doc.extract_spans_raw(page).unwrap());
+    let mut mcids: Vec<u32> = doc
+        .mc_actualtext_mcids
+        .lock_or_recover()
+        .get(&page)
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    mcids.sort_unstable();
+    let paints = format!("{:?}", doc.raw_paints.lock_or_recover().get(&(page, false)));
+    (spans, format!("{mcids:?}"), paints)
+}
+
+#[test]
+fn seeded_raw_spans_equal_an_extraction() {
+    for facts in [false, true] {
+        let bytes = running_heads_pdf(6);
+        let fresh = PdfDocument::from_bytes(bytes.clone()).unwrap();
+        fresh.set_visibility_facts(facts);
+        let scanned = PdfDocument::from_bytes(bytes).unwrap();
+        scanned.set_visibility_facts(facts);
+        scanned.ensure_running_artifact_signatures().unwrap();
+        assert_eq!(scanned.raw_spans_seeds.lock_or_recover().len(), 6);
+        for page in 0..6 {
+            if page % 2 == 1 {
+                // A filtered extraction first (the hidden-layer pass does
+                // that) replaces the page's MCID set; the raw one replaces
+                // it again, seeded or not.
+                for doc in [&fresh, &scanned] {
+                    let inks: HashSet<String> = ["Spot".to_string()].into();
+                    doc.extract_spans_raw_filtered(page, Default::default(), inks)
+                        .unwrap();
+                }
+            }
+            assert_ne!(raw_extraction_of(&fresh, page).1, "[]", "ActualText MCIDs");
+            assert_eq!(
+                raw_extraction_of(&scanned, page),
+                raw_extraction_of(&fresh, page),
+                "page {page}, facts {facts}"
+            );
+        }
+        assert_eq!(scanned.raw_spans_seeds.lock_or_recover().len(), 0, "taken once");
+    }
+}
+
+#[test]
+fn no_seed_where_the_scan_bypassed_the_form_span_cache() {
+    let doc = PdfDocument::from_bytes(header_form_pdf(4)).unwrap();
+    doc.ensure_running_artifact_signatures().unwrap();
+    assert_eq!(doc.raw_spans_seeds.lock_or_recover().len(), 0);
+    // With visibility facts the cache is off for every extraction: seeded.
+    let facts = PdfDocument::from_bytes(header_form_pdf(4)).unwrap();
+    facts.set_visibility_facts(true);
+    facts.ensure_running_artifact_signatures().unwrap();
+    assert_eq!(facts.raw_spans_seeds.lock_or_recover().len(), 4);
+    facts.forget_page(1);
+    assert_eq!(facts.raw_spans_seeds.lock_or_recover().len(), 3);
+    facts.set_visibility_facts(true);
+    assert_eq!(facts.raw_spans_seeds.lock_or_recover().len(), 0);
+}
+
+#[test]
+fn only_a_document_that_fits_the_page_caches_is_seeded() {
+    let fits = PdfDocument::from_bytes(running_heads_pdf(page_cache_entries())).unwrap();
+    fits.ensure_running_artifact_signatures().unwrap();
+    assert_eq!(fits.raw_spans_seeds.lock_or_recover().len(), page_cache_entries());
+    let longer = PdfDocument::from_bytes(running_heads_pdf(page_cache_entries() + 1)).unwrap();
+    longer.ensure_running_artifact_signatures().unwrap();
+    assert_eq!(longer.raw_spans_seeds.lock_or_recover().len(), 0);
 }

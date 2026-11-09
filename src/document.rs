@@ -66,7 +66,9 @@ mod font_sets;
 mod layers;
 mod page_refs;
 mod pdf_reader;
+mod scan_seed;
 use pdf_reader::PdfReader;
+use scan_seed::{RawSpansTrace, ScanSeed};
 
 /// Maximum recursion depth for object resolution
 const MAX_RECURSION_DEPTH: u32 = 100;
@@ -585,7 +587,7 @@ pub struct PdfDocument {
     /// reading-order path publishes the matching one into `page_visibility`,
     /// so an unfiltered extraction run by another API (e.g. `classify_page`)
     /// cannot replace the facts of a filtered `extract_structured_filtered`.
-    raw_paints: Mutex<HashMap<(usize, bool), Vec<crate::extractors::visibility::PaintEvent>>>,
+    raw_paints: Mutex<HashMap<(usize, bool), Arc<Vec<crate::extractors::visibility::PaintEvent>>>>,
     /// Per-XObject dict facts for visibility paint events (see
     /// `TextExtractor::record_xobject_paint`).
     pub(crate) xobject_paint_meta:
@@ -632,6 +634,10 @@ pub struct PdfDocument {
     /// Page index → page object reference, from one page-tree walk (see
     /// `document/page_refs.rs`); built on the first `get_page_ref`.
     page_ref_index: Mutex<Option<Arc<Vec<ObjectRef>>>>,
+    /// Raw spans of the first pages kept from the running header/footer
+    /// scan for the page's next `extract_spans_raw` miss (see
+    /// `document/scan_seed.rs`). Dropped with the span caches.
+    raw_spans_seeds: Mutex<HashMap<usize, ScanSeed>>,
     /// Document-wide article threads (`/Threads`), parsed once. Reading-order
     /// resolution consults them per page, and parsing walks the whole page
     /// tree — so without this the cost per page scaled with the document.
@@ -1386,6 +1392,7 @@ impl PdfDocument {
             page_paths_cache: Mutex::new(BoundedEntryCache::new(page_cache_entries())),
             running_artifact_signatures: Mutex::new(None),
             page_ref_index: Mutex::new(None),
+            raw_spans_seeds: Mutex::new(HashMap::new()),
             article_threads_cache: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
             accumulated_warnings: Mutex::new(Vec::new()),
@@ -1741,6 +1748,9 @@ impl PdfDocument {
                 self.object_cache.lock_or_recover().clear();
                 // The page tree may read differently once decrypted.
                 *self.page_ref_index.lock_or_recover() = None;
+                // Seeds of the running header/footer scan were extracted
+                // before the password (empty pages).
+                self.drop_raw_spans_seeds(None);
                 log::debug!(
                     "authenticate(): object cache cleared after successful authentication \
                      to force re-decryption of any pre-auth cached objects"
@@ -7529,6 +7539,7 @@ impl PdfDocument {
         self.visibility_facts.store(enabled, Ordering::Relaxed);
         self.page_spans_cache.lock_or_recover().clear();
         self.page_raw_spans_cache.lock_or_recover().clear();
+        self.drop_raw_spans_seeds(None);
         self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         self.page_visibility.lock_or_recover().clear();
@@ -7565,6 +7576,7 @@ impl PdfDocument {
         // Redaction changes a page's spans; drop the span cache.
         self.page_spans_cache.lock_or_recover().clear();
         self.page_raw_spans_cache.lock_or_recover().clear();
+        self.drop_raw_spans_seeds(None);
         self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         Ok(())
@@ -7575,6 +7587,7 @@ impl PdfDocument {
         self.erase_regions.lock_or_recover().remove(&page_index);
         self.page_spans_cache.lock_or_recover().clear();
         self.page_raw_spans_cache.lock_or_recover().clear();
+        self.drop_raw_spans_seeds(None);
         self.page_words_cache.lock_or_recover().clear();
         self.search_index.lock_or_recover().clear();
         Ok(())
@@ -7588,6 +7601,7 @@ impl PdfDocument {
         self.page_content_cache.lock_or_recover().remove(&page_index);
         self.page_spans_cache.lock_or_recover().remove(&page_index);
         self.page_raw_spans_cache.lock_or_recover().remove(&page_index);
+        self.drop_raw_spans_seeds(Some(page_index));
         self.page_chars_cache.lock_or_recover().remove(&page_index);
         self.page_words_cache.lock_or_recover().remove(&page_index);
         self.page_paths_cache.lock_or_recover().remove(&page_index);
@@ -17103,13 +17117,16 @@ impl PdfDocument {
     /// title near the top would make that title a "running header" on every
     /// page), and every band span's signature, box and trimmed text, in span
     /// order. `None` when the page's spans or media box cannot be read.
-    fn scan_page(&self, pi: usize) -> Option<ScanPage> {
-        let spans = self.extract_spans_for_scan(pi).ok()?;
+    fn scan_page(&self, pi: usize, seed: bool) -> Option<ScanPage> {
+        self.extract_spans_for_scan(pi, seed, |spans| self.summarize_scanned_page(pi, spans))
+    }
+
+    fn summarize_scanned_page(&self, pi: usize, spans: &[TextSpan]) -> Option<ScanPage> {
         let (page_width, page_height) = match self.get_page_media_box(pi) {
             Ok((_, _, w, h)) if h > 0.0 => (w, h),
             _ => return None,
         };
-        let vertical = Self::page_is_vertical(&spans);
+        let vertical = Self::page_is_vertical(spans);
         let body = spans.iter().any(|s| {
             !s.text.trim().is_empty()
                 && !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
@@ -17137,7 +17154,12 @@ impl PdfDocument {
     /// current rayon pool, each taking the next page from a shared counter;
     /// back in page order.
     #[cfg(feature = "parallel")]
-    fn scan_pages_parallel(&self, page_count: usize, threads: usize) -> Vec<Option<ScanPage>> {
+    fn scan_pages_parallel(
+        &self,
+        page_count: usize,
+        threads: usize,
+        seed: bool,
+    ) -> Vec<Option<ScanPage>> {
         use rayon::prelude::*;
         let next = AtomicUsize::new(0);
         let mut pages: Vec<(usize, Option<ScanPage>)> = (0..threads.min(page_count))
@@ -17150,7 +17172,7 @@ impl PdfDocument {
                     if pi >= page_count {
                         break;
                     }
-                    out.push((pi, self.scan_page(pi)));
+                    out.push((pi, self.scan_page(pi, seed)));
                 }
                 out
             })
@@ -17217,17 +17239,20 @@ impl PdfDocument {
         // parallel (`scan_threads > 1`); each page is reduced to its
         // `ScanPage` on the spot and the aggregation below stays sequential,
         // in page order.
+        // A document that fits the page caches keeps the scan's raw spans
+        // for the caller's pass (`document/scan_seed.rs`).
+        let seed = page_count <= page_cache_entries();
         let pages: Vec<Option<ScanPage>> = if scan_threads > 1 {
             #[cfg(feature = "parallel")]
             {
-                self.scan_pages_parallel(page_count, scan_threads)
+                self.scan_pages_parallel(page_count, scan_threads, seed)
             }
             #[cfg(not(feature = "parallel"))]
             {
-                (0..page_count).map(|pi| self.scan_page(pi)).collect()
+                (0..page_count).map(|pi| self.scan_page(pi, seed)).collect()
             }
         } else {
-            (0..page_count).map(|pi| self.scan_page(pi)).collect()
+            (0..page_count).map(|pi| self.scan_page(pi, seed)).collect()
         };
         for (pi, page) in pages.into_iter().enumerate() {
             let Some(ScanPage { body, band }) = page else {
@@ -17452,7 +17477,10 @@ impl PdfDocument {
         if let Some(cached) = self.page_raw_spans_cache.lock_or_recover().get(&page_index) {
             return Ok((**cached).clone());
         }
-        let spans = self.extract_spans_raw_uncached(page_index)?;
+        let spans = match self.take_seeded_raw_spans(page_index) {
+            Some(spans) => spans,
+            None => self.extract_spans_raw_uncached(page_index)?,
+        };
         self.page_raw_spans_cache
             .lock_or_recover()
             .insert(page_index, std::sync::Arc::new(spans.clone()));
@@ -17482,16 +17510,6 @@ impl PdfDocument {
         self.extract_spans_impl(page_index, config, Default::default(), HashSet::new(), false)
     }
 
-    /// Raw spans for the running header/footer scan. The scan walks pages in
-    /// its own order (in parallel when the caller is not a rayon worker or
-    /// asks for it, `scan_running_artifacts_on_current_pool`), so it
-    /// keeps out of the Form XObject span cache, whose entries carry the page
-    /// that filled them: the caller's own extraction order alone fills it.
-    fn extract_spans_for_scan(&self, page_index: usize) -> Result<Vec<TextSpan>> {
-        let config = crate::extractors::TextExtractionConfig::default();
-        self.extract_spans_impl(page_index, config, Default::default(), HashSet::new(), true)
-    }
-
     fn extract_spans_raw_filtered(
         &self,
         page_index: usize,
@@ -17515,9 +17533,32 @@ impl PdfDocument {
         excluded_inks: HashSet<String>,
         bypass_form_span_cache: bool,
     ) -> Result<Vec<crate::layout::TextSpan>> {
+        let (spans, _) = self.extract_spans_traced(
+            page_index,
+            config,
+            excluded_layers,
+            excluded_inks,
+            bypass_form_span_cache,
+            false,
+        )?;
+        Ok(spans)
+    }
+
+    /// [`Self::extract_spans_impl`]; with `trace`, also what the extraction
+    /// wrote into the document and whether it skipped the Form XObject span
+    /// cache (see [`RawSpansTrace`]).
+    fn extract_spans_traced(
+        &self,
+        page_index: usize,
+        config: crate::extractors::TextExtractionConfig,
+        excluded_layers: crate::optional_content::LayerFilter,
+        excluded_inks: HashSet<String>,
+        bypass_form_span_cache: bool,
+        trace: bool,
+    ) -> Result<(Vec<crate::layout::TextSpan>, RawSpansTrace)> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning no spans");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), RawSpansTrace::default()));
         }
         use crate::extractors::TextExtractor;
 
@@ -17528,7 +17569,7 @@ impl PdfDocument {
         })?;
 
         if self.page_cannot_have_text(page_dict) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), RawSpansTrace::default()));
         }
 
         let content_data = match self.cached_page_content(page_index) {
@@ -17539,12 +17580,12 @@ impl PdfDocument {
                     page_index,
                     e
                 );
-                return Ok(Vec::new());
+                return Ok((Vec::new(), RawSpansTrace::default()));
             },
         };
 
         if !Self::may_contain_text(&content_data) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), RawSpansTrace::default()));
         }
 
         let mut extractor = TextExtractor::with_config(config);
@@ -17579,8 +17620,12 @@ impl PdfDocument {
         }
 
         let spans = extractor.extract_text_spans(&content_data)?;
+        let mut traced = RawSpansTrace::default();
         if visibility_facts {
-            let paints = extractor.take_paint_events();
+            let paints = Arc::new(extractor.take_paint_events());
+            if trace {
+                traced.paints = Some(Arc::clone(&paints));
+            }
             self.raw_paints
                 .lock_or_recover()
                 .insert((page_index, filtered), paints);
@@ -17596,13 +17641,18 @@ impl PdfDocument {
         // an earlier filter-set leak into a later, differently-
         // filtered call.
         let mc_set = extractor.take_mc_actualtext_mcids();
+        if trace {
+            traced.wrote = true;
+            traced.mcids = mc_set.clone();
+            traced.form_span_cache_skipped = extractor.form_span_cache_skipped();
+        }
         let mut guard = self.mc_actualtext_mcids.lock_or_recover();
         if mc_set.is_empty() {
             guard.remove(&page_index);
         } else {
             guard.insert(page_index, mc_set);
         }
-        Ok(spans)
+        Ok((spans, traced))
     }
 
     /// Extract text from a page, excluding content from specified layers and inks.
@@ -17748,7 +17798,7 @@ impl PdfDocument {
                 .raw_paints
                 .lock_or_recover()
                 .get(&(page_index, filtered))
-                .cloned()
+                .map(|paints| (**paints).clone())
                 .unwrap_or_default();
             let pv = crate::extractors::visibility::PageVisibility {
                 paints,

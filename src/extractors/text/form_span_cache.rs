@@ -26,11 +26,30 @@ impl<'doc> TextExtractor<'doc> {
     /// OC are inherited from the caller at `Do`), so visibility facts bypass
     /// the cache like the emission filters do.
     pub(super) fn form_span_cache_on(&self) -> bool {
+        self.form_span_cache_eligible() && !self.form_span_cache_off
+    }
+
+    fn form_span_cache_eligible(&self) -> bool {
         self.extract_spans
-            && !self.form_span_cache_off
             && self.excluded_layers.is_empty()
             && self.excluded_inks.is_empty()
             && self.vis.is_none()
+    }
+
+    /// At a Form XObject's span-cache lookup: remember when only the bypass
+    /// kept the cache out.
+    pub(super) fn note_form_span_cache_skip(&mut self) {
+        if self.form_span_cache_off && self.form_span_cache_eligible() {
+            self.form_span_cache_skipped = true;
+        }
+    }
+
+    /// Whether this extraction reached a Form XObject span-cache lookup that
+    /// [`Self::bypass_form_span_cache`] skipped. When it did not, the same
+    /// extraction without the bypass would neither have read nor filled the
+    /// cache: its spans and its writes into the document are the same.
+    pub(crate) fn form_span_cache_skipped(&self) -> bool {
+        self.form_span_cache_skipped
     }
 
     /// Replay the cached spans of `key`; `false` when there is no entry.

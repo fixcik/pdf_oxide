@@ -93,6 +93,11 @@ impl<K: Eq + std::hash::Hash + Copy, V> BoundedEntryCache<K, V> {
         Some(v)
     }
 
+    /// Whether `key` has an entry, without promoting it.
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }

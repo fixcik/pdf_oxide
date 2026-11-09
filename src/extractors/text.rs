@@ -2410,6 +2410,9 @@ pub struct TextExtractor<'doc> {
     vis: Option<Box<crate::extractors::visibility::VisibilityTracker>>,
     /// Skip the document's Form XObject span cache (see `form_span_cache`).
     form_span_cache_off: bool,
+    /// A Form XObject was painted where the span cache would have been read
+    /// (and maybe filled) but for `form_span_cache_off`.
+    form_span_cache_skipped: bool,
 }
 
 mod form_span_cache;
@@ -2507,6 +2510,7 @@ impl<'doc> TextExtractor<'doc> {
             mcid_scope_stack: vec![crate::structure::McidScope::Page(0)],
             vis: None,
             form_span_cache_off: false,
+            form_span_cache_skipped: false,
         }
     }
 
@@ -7280,6 +7284,7 @@ impl<'doc> TextExtractor<'doc> {
         // `ctm_key` was already computed above for the `processed_xobjects` guard.
         let spans_cache_key = (xobject_ref, ctm_key);
         let span_cache_on = self.form_span_cache_on();
+        self.note_form_span_cache_skip();
         if span_cache_on && self.replay_cached_form_spans(&spans_cache_key) {
             return Ok(());
         }
